@@ -375,16 +375,22 @@ impl App {
             }
             // Handle ManagePackages screen transitions
             if current_screen == Screen::ManagePackages {
-                // Load packages from active profile first (before mutable borrow)
-                let packages = self
+                // Load common and profile packages
+                let profile_packages = self
                     .get_active_profile_info()
                     .ok()
                     .flatten()
                     .map(|p| p.packages.clone())
                     .unwrap_or_default();
+                let common_packages =
+                    crate::services::PackageService::get_common_packages(&self.config.repo_path)
+                        .unwrap_or_default();
 
-                self.manage_packages_screen
-                    .update_packages(packages, &self.config.active_profile);
+                self.manage_packages_screen.update_all_packages(
+                    common_packages,
+                    profile_packages,
+                    &self.config.active_profile,
+                );
             } else if self.last_screen == Some(Screen::ManagePackages) {
                 // We just left ManagePackages - clear installation state to prevent it from showing elsewhere
                 self.manage_packages_screen.reset_state();
@@ -940,14 +946,21 @@ impl App {
                 // Only update packages if the profile has changed, to avoid interrupting
                 // any background checks or clearing state unnecessarily.
                 if self.config.active_profile != self.manage_packages_screen.state.active_profile {
-                    // Load packages from active profile into screen state
-                    if let Ok(Some(active_profile)) = self.get_active_profile_info() {
-                        self.manage_packages_screen
-                            .update_packages(active_profile.packages, &self.config.active_profile);
-                    } else {
-                        self.manage_packages_screen
-                            .update_packages(Vec::new(), &self.config.active_profile);
-                    }
+                    let profile_packages =
+                        if let Ok(Some(active_profile)) = self.get_active_profile_info() {
+                            active_profile.packages
+                        } else {
+                            Vec::new()
+                        };
+                    let common_packages = crate::services::PackageService::get_common_packages(
+                        &self.config.repo_path,
+                    )
+                    .unwrap_or_default();
+                    self.manage_packages_screen.update_all_packages(
+                        common_packages,
+                        profile_packages,
+                        &self.config.active_profile,
+                    );
                 }
             }
             Screen::StorageSetup => {
@@ -1006,6 +1019,56 @@ impl App {
             ScreenAction::InstallMissingPackages => {
                 self.manage_packages_screen
                     .start_installing_missing_packages();
+            }
+            ScreenAction::MovePackageToCommon { index } => {
+                match crate::services::PackageService::move_package_to_common(
+                    &self.config.repo_path,
+                    &self.config.active_profile,
+                    index,
+                ) {
+                    Ok((common_packages, profile_packages)) => {
+                        self.manage_packages_screen.update_all_packages(
+                            common_packages,
+                            profile_packages,
+                            &self.config.active_profile,
+                        );
+                        self.toast_manager.push(crate::widgets::Toast::new(
+                            "Package moved to common".to_string(),
+                            crate::widgets::ToastVariant::Success,
+                        ));
+                    }
+                    Err(e) => {
+                        self.toast_manager.push(crate::widgets::Toast::new(
+                            format!("Failed to move package: {e}"),
+                            crate::widgets::ToastVariant::Error,
+                        ));
+                    }
+                }
+            }
+            ScreenAction::MovePackageFromCommon { index } => {
+                match crate::services::PackageService::move_package_from_common(
+                    &self.config.repo_path,
+                    &self.config.active_profile,
+                    index,
+                ) {
+                    Ok((common_packages, profile_packages)) => {
+                        self.manage_packages_screen.update_all_packages(
+                            common_packages,
+                            profile_packages,
+                            &self.config.active_profile,
+                        );
+                        self.toast_manager.push(crate::widgets::Toast::new(
+                            "Package moved to profile".to_string(),
+                            crate::widgets::ToastVariant::Success,
+                        ));
+                    }
+                    Err(e) => {
+                        self.toast_manager.push(crate::widgets::Toast::new(
+                            format!("Failed to move package: {e}"),
+                            crate::widgets::ToastVariant::Error,
+                        ));
+                    }
+                }
             }
             ScreenAction::UpdateSetting {
                 setting,

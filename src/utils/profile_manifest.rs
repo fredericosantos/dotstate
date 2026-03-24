@@ -55,12 +55,15 @@ pub struct Package {
     pub manager_check: Option<String>,
 }
 
-/// Common section for files shared across all profiles
+/// Common section for files and packages shared across all profiles
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct CommonSection {
     /// Files synced to all profiles (relative paths from home directory)
     #[serde(default)]
     pub synced_files: Vec<String>,
+    /// Packages shared across all profiles
+    #[serde(default)]
+    pub packages: Vec<Package>,
 }
 
 /// Reserved profile names that cannot be used
@@ -141,6 +144,7 @@ impl ProfileManifest {
 
             // Sort synced_files alphabetically to ensure consistent ordering
             manifest.common.synced_files.sort();
+            manifest.common.packages.sort_by(|a, b| a.name.cmp(&b.name));
             for profile in &mut manifest.profiles {
                 profile.synced_files.sort();
             }
@@ -446,6 +450,87 @@ impl ProfileManifest {
             ))
         }
     }
+
+    // ==================== Common Package Methods ====================
+
+    /// Add a package to the common section (shared across all profiles).
+    /// Deduplicates by name; keeps list sorted alphabetically.
+    pub fn add_common_package(&mut self, package: Package) {
+        if !self.common.packages.iter().any(|p| p.name == package.name) {
+            self.common.packages.push(package);
+            self.common.packages.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+    }
+
+    /// Remove a package from the common section by name.
+    /// Returns true if the package was found and removed.
+    pub fn remove_common_package(&mut self, name: &str) -> bool {
+        let initial_len = self.common.packages.len();
+        self.common.packages.retain(|p| p.name != name);
+        self.common.packages.len() < initial_len
+    }
+
+    /// Get all common packages.
+    #[must_use]
+    pub fn get_common_packages(&self) -> &[Package] {
+        &self.common.packages
+    }
+
+    /// Check if a package with the given name exists in the common section.
+    #[must_use]
+    pub fn is_common_package(&self, name: &str) -> bool {
+        self.common.packages.iter().any(|p| p.name == name)
+    }
+
+    /// Move a package from a profile to the common section.
+    pub fn move_package_to_common(&mut self, profile_name: &str, index: usize) -> Result<()> {
+        // Extract the package from the profile first (releases mutable borrow)
+        let package =
+            if let Some(profile) = self.profiles.iter_mut().find(|p| p.name == profile_name) {
+                if index < profile.packages.len() {
+                    profile.packages.remove(index)
+                } else {
+                    return Err(anyhow::anyhow!(
+                        "Package index {index} out of bounds in profile '{profile_name}'"
+                    ));
+                }
+            } else {
+                return Err(anyhow::anyhow!(
+                    "Profile '{profile_name}' not found in manifest"
+                ));
+            };
+
+        self.add_common_package(package);
+        Ok(())
+    }
+
+    /// Move a package from the common section (by index) to a profile.
+    pub fn move_package_from_common_by_index(
+        &mut self,
+        profile_name: &str,
+        index: usize,
+    ) -> Result<()> {
+        if index >= self.common.packages.len() {
+            return Err(anyhow::anyhow!(
+                "Common package index {index} out of bounds"
+            ));
+        }
+
+        let package = self.common.packages.remove(index);
+
+        if let Some(profile) = self.profiles.iter_mut().find(|p| p.name == profile_name) {
+            if !profile.packages.iter().any(|p| p.name == package.name) {
+                profile.packages.push(package);
+            }
+            Ok(())
+        } else {
+            // Restore the package to common if profile not found
+            self.common.packages.insert(index, package);
+            Err(anyhow::anyhow!(
+                "Profile '{profile_name}' not found in manifest"
+            ))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -630,5 +715,125 @@ synced_files = []
     fn test_new_manifest_has_current_version() {
         let manifest = ProfileManifest::default();
         assert_eq!(manifest.version, 1);
+    }
+
+    fn make_package(name: &str) -> Package {
+        Package {
+            name: name.to_string(),
+            description: None,
+            manager: PackageManager::Brew,
+            package_name: Some(name.to_string()),
+            binary_name: name.to_string(),
+            install_command: None,
+            existence_check: None,
+            manager_check: None,
+        }
+    }
+
+    #[test]
+    fn test_common_packages() {
+        let mut manifest = ProfileManifest::default();
+
+        manifest.add_common_package(make_package("git"));
+        manifest.add_common_package(make_package("ripgrep"));
+        assert_eq!(manifest.get_common_packages().len(), 2);
+        assert!(manifest.is_common_package("git"));
+        assert!(manifest.is_common_package("ripgrep"));
+
+        // Adding duplicate should not increase count
+        manifest.add_common_package(make_package("git"));
+        assert_eq!(manifest.get_common_packages().len(), 2);
+
+        // Remove
+        assert!(manifest.remove_common_package("ripgrep"));
+        assert_eq!(manifest.get_common_packages().len(), 1);
+        assert!(!manifest.is_common_package("ripgrep"));
+
+        // Remove non-existent returns false
+        assert!(!manifest.remove_common_package("nonexistent"));
+    }
+
+    #[test]
+    fn test_common_packages_sorted() {
+        let mut manifest = ProfileManifest::default();
+        manifest.add_common_package(make_package("zsh"));
+        manifest.add_common_package(make_package("awk"));
+        manifest.add_common_package(make_package("git"));
+        let names: Vec<&str> = manifest
+            .get_common_packages()
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["awk", "git", "zsh"]);
+    }
+
+    #[test]
+    fn test_move_package_to_common() {
+        let mut manifest = ProfileManifest::default();
+        manifest.add_profile("work".to_string(), None);
+        if let Some(p) = manifest.profiles.iter_mut().find(|p| p.name == "work") {
+            p.packages.push(make_package("git"));
+        }
+
+        manifest.move_package_to_common("work", 0).unwrap();
+
+        assert!(manifest.is_common_package("git"));
+        let profile = manifest.profiles.iter().find(|p| p.name == "work").unwrap();
+        assert!(profile.packages.is_empty());
+    }
+
+    #[test]
+    fn test_move_package_from_common_by_index() {
+        let mut manifest = ProfileManifest::default();
+        manifest.add_profile("work".to_string(), None);
+        manifest.add_common_package(make_package("git"));
+
+        manifest
+            .move_package_from_common_by_index("work", 0)
+            .unwrap();
+
+        assert!(!manifest.is_common_package("git"));
+        let profile = manifest.profiles.iter().find(|p| p.name == "work").unwrap();
+        assert_eq!(profile.packages.len(), 1);
+        assert_eq!(profile.packages[0].name, "git");
+    }
+
+    #[test]
+    fn test_common_packages_toml_roundtrip() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_path = temp_dir.path();
+
+        let mut manifest = ProfileManifest::default();
+        manifest.add_common_package(make_package("git"));
+        manifest.add_common_package(make_package("ripgrep"));
+        manifest.save(repo_path).unwrap();
+
+        let loaded = ProfileManifest::load(repo_path).unwrap();
+        assert_eq!(loaded.get_common_packages().len(), 2);
+        assert!(loaded.is_common_package("git"));
+        assert!(loaded.is_common_package("ripgrep"));
+    }
+
+    #[test]
+    fn test_common_packages_backward_compat() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_path = temp_dir.path();
+
+        // Old manifest without packages in [common]
+        let old_manifest = r#"
+version = 1
+
+[common]
+synced_files = [".gitconfig"]
+
+[[profiles]]
+name = "work"
+synced_files = []
+"#;
+        std::fs::write(ProfileManifest::manifest_path(repo_path), old_manifest).unwrap();
+
+        let loaded = ProfileManifest::load(repo_path).unwrap();
+        assert_eq!(loaded.get_common_packages().len(), 0);
+        assert!(loaded.is_common_file(".gitconfig"));
     }
 }

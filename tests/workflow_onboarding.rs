@@ -513,6 +513,7 @@ fn github_clone_existing_dotstate_repo() -> Result<()> {
         version: 1,
         common: dotstate::utils::profile_manifest::CommonSection {
             synced_files: vec![".gitconfig".to_string()],
+            packages: vec![],
         },
         profiles: vec![
             ProfileInfo {

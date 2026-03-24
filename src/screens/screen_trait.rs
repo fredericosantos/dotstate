@@ -215,6 +215,16 @@ pub enum ScreenAction {
     // Package management actions
     /// Trigger installation of all missing packages.
     InstallMissingPackages,
+    /// Move a package from active profile to common section.
+    MovePackageToCommon {
+        /// Index of the package in the profile packages list.
+        index: usize,
+    },
+    /// Move a package from common section to active profile.
+    MovePackageFromCommon {
+        /// Index of the package in the common packages list.
+        index: usize,
+    },
     // Settings actions
     /// Update a setting value.
     UpdateSetting {

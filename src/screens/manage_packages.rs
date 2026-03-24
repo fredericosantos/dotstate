@@ -23,6 +23,23 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Padding, Paragraph, Tabs,
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
+/// Flat list item for the package list, combining common and profile packages with section headers.
+#[derive(Debug, Clone)]
+enum DisplayItem {
+    Header(String),
+    PackageCommon(usize),  // index into state.common_packages
+    PackageProfile(usize), // index into state.packages
+}
+
+/// Resolved selection from the flat display list.
+#[derive(Debug)]
+enum SelectedPackageItem {
+    Common(usize),  // index into state.common_packages
+    Profile(usize), // index into state.packages
+    Header,
+    None,
+}
+
 pub struct ManagePackagesScreen {
     pub state: PackageManagerState,
     /// Mouse regions for package list items (value = package index)
@@ -86,17 +103,99 @@ impl ManagePackagesScreen {
         self.state.package_statuses = statuses;
     }
 
+    /// Update both common and profile packages at once.
+    pub fn update_all_packages(
+        &mut self,
+        common_packages: Vec<Package>,
+        profile_packages: Vec<Package>,
+        active_profile: &str,
+    ) {
+        self.state.active_profile = active_profile.to_string();
+
+        // Initialize common package statuses from cache (profile_name = "common")
+        let mut common_statuses = Vec::with_capacity(common_packages.len());
+        for package in &common_packages {
+            if let Some(entry) = self.state.cache.get_status("common", &package.name) {
+                if entry.installed {
+                    common_statuses.push(PackageStatus::Installed);
+                } else {
+                    common_statuses.push(PackageStatus::NotInstalled);
+                }
+            } else {
+                common_statuses.push(PackageStatus::Unknown);
+            }
+        }
+        self.state.common_packages = common_packages;
+        self.state.common_package_statuses = common_statuses;
+
+        // Initialize profile package statuses from cache
+        let mut profile_statuses = Vec::with_capacity(profile_packages.len());
+        for package in &profile_packages {
+            if let Some(entry) = self.state.cache.get_status(active_profile, &package.name) {
+                if entry.installed {
+                    profile_statuses.push(PackageStatus::Installed);
+                } else {
+                    profile_statuses.push(PackageStatus::NotInstalled);
+                }
+            } else {
+                profile_statuses.push(PackageStatus::Unknown);
+            }
+        }
+        self.state.packages = profile_packages;
+        self.state.package_statuses = profile_statuses;
+    }
+
+    /// Build the flat display list combining common and profile packages with section headers.
+    fn build_display_items(&self) -> Vec<DisplayItem> {
+        let mut items = Vec::new();
+
+        if !self.state.common_packages.is_empty() {
+            items.push(DisplayItem::Header("Common Packages (Shared)".to_string()));
+            for i in 0..self.state.common_packages.len() {
+                items.push(DisplayItem::PackageCommon(i));
+            }
+        }
+
+        if !self.state.packages.is_empty() {
+            items.push(DisplayItem::Header(format!(
+                "Profile Packages ({})",
+                self.state.active_profile
+            )));
+            for i in 0..self.state.packages.len() {
+                items.push(DisplayItem::PackageProfile(i));
+            }
+        }
+
+        items
+    }
+
+    /// Resolve the currently selected display item.
+    fn get_selected_item(&self) -> SelectedPackageItem {
+        let display_items = self.build_display_items();
+        match self.state.list_state.selected() {
+            None => SelectedPackageItem::None,
+            Some(idx) => match display_items.get(idx) {
+                Some(DisplayItem::Header(_)) => SelectedPackageItem::Header,
+                Some(DisplayItem::PackageCommon(i)) => SelectedPackageItem::Common(*i),
+                Some(DisplayItem::PackageProfile(i)) => SelectedPackageItem::Profile(*i),
+                None => SelectedPackageItem::None,
+            },
+        }
+    }
+
     pub fn reset_state(&mut self) {
         self.state.installation_step = InstallationStep::NotStarted;
         self.state.installation_output.clear();
         self.state.installation_output_scroll = 0;
         self.state.popup_type = PackagePopupType::None;
+        self.state.is_adding_common = false;
     }
 
     pub fn start_checking(&mut self) {
         let state = &mut self.state;
         state.is_checking = true;
         state.checking_index = None;
+        state.checking_is_common = true; // Check common packages first
         state.checking_delay_until = Some(std::time::Instant::now() + Duration::from_millis(100));
         // Don't reset statuses here - they are initialized by update_packages (potentially from cache)
         // Only packages with Unknown status will be checked by process_package_check_step
@@ -104,25 +203,40 @@ impl ManagePackagesScreen {
 
     pub fn start_installing_missing_packages(&mut self) {
         let state = &mut self.state;
-        let mut packages_to_install = Vec::new();
+        // Collect missing: (index, is_common)
+        let mut packages_to_install: Vec<(usize, bool)> = Vec::new();
+        for (idx, status) in state.common_package_statuses.iter().enumerate() {
+            if matches!(status, PackageStatus::NotInstalled) {
+                packages_to_install.push((idx, true));
+            }
+        }
         for (idx, status) in state.package_statuses.iter().enumerate() {
             if matches!(status, PackageStatus::NotInstalled) {
-                packages_to_install.push(idx);
+                packages_to_install.push((idx, false));
             }
         }
 
         if !packages_to_install.is_empty() {
-            let first_idx = packages_to_install[0];
-            let package_name = if let Some(p) = state.packages.get(first_idx) {
-                p.name.clone()
+            let (first_idx, first_is_common) = packages_to_install[0];
+            let package_name = if first_is_common {
+                state
+                    .common_packages
+                    .get(first_idx)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| "Unknown".to_string())
             } else {
-                "Unknown".to_string()
+                state
+                    .packages
+                    .get(first_idx)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| "Unknown".to_string())
             };
             let total = packages_to_install.len();
             let remaining = packages_to_install[1..].to_vec();
 
             state.installation_step = InstallationStep::Installing {
                 package_index: first_idx,
+                package_is_common: first_is_common,
                 package_name,
                 total_packages: total,
                 packages_to_install: remaining,
@@ -186,80 +300,122 @@ impl ManagePackagesScreen {
     fn process_package_check_step(&mut self) -> Result<()> {
         let state = &mut self.state;
 
-        if state.packages.is_empty() {
+        let both_empty = state.common_packages.is_empty() && state.packages.is_empty();
+        if both_empty {
             state.is_checking = false;
             return Ok(());
         }
 
-        // Initialize statuses if needed
+        // Ensure status vecs are correctly sized
+        if state.common_package_statuses.len() != state.common_packages.len() {
+            state.common_package_statuses =
+                vec![PackageStatus::Unknown; state.common_packages.len()];
+        }
         if state.package_statuses.len() != state.packages.len() {
             state.package_statuses = vec![PackageStatus::Unknown; state.packages.len()];
         }
 
         // STEP 1: If we have a target package to check, check it now.
         if let Some(index) = state.checking_index {
-            if index < state.packages.len() {
-                let package = &state.packages[index];
-                debug!("Checking package: {} (index: {})", package.name, index);
+            let is_common = state.checking_is_common;
+            let (package, cache_profile) = if is_common {
+                if let Some(p) = state.common_packages.get(index) {
+                    (p.clone(), "common".to_string())
+                } else {
+                    state.checking_index = None;
+                    return Ok(());
+                }
+            } else if let Some(p) = state.packages.get(index) {
+                (p.clone(), state.active_profile.clone())
+            } else {
+                state.checking_index = None;
+                return Ok(());
+            };
 
-                let check_result = PackageInstaller::check_exists(package);
-                let pkg_name = package.name.clone();
-                let pkg_manager = package.manager.clone();
+            debug!(
+                "Checking {} package: {} (index: {})",
+                if is_common { "common" } else { "profile" },
+                package.name,
+                index
+            );
 
-                match check_result {
-                    Ok((exists, check_cmd, output)) => {
-                        // Update cache
-                        if !state.active_profile.is_empty() {
-                            if let Err(e) = state.cache.update_status(
-                                &state.active_profile,
-                                &pkg_name,
-                                exists,
-                                check_cmd.clone(),
-                                output.clone(),
-                            ) {
-                                warn!("Failed to update package cache: {}", e);
-                            }
-                        }
+            let check_result = PackageInstaller::check_exists(&package);
+            let pkg_name = package.name.clone();
+            let pkg_manager = package.manager.clone();
 
-                        if exists {
-                            state.package_statuses[index] = PackageStatus::Installed;
-                        } else if !PackageManagerImpl::is_manager_installed(&pkg_manager) {
-                            state.package_statuses[index] = PackageStatus::Error(format!(
-                                "Package not found and package manager '{pkg_manager:?}' is not installed"
-                            ));
-                        } else {
-                            state.package_statuses[index] = PackageStatus::NotInstalled;
+            match check_result {
+                Ok((exists, check_cmd, output)) => {
+                    if !cache_profile.is_empty() {
+                        if let Err(e) = state.cache.update_status(
+                            &cache_profile,
+                            &pkg_name,
+                            exists,
+                            check_cmd.clone(),
+                            output.clone(),
+                        ) {
+                            warn!("Failed to update package cache: {}", e);
                         }
                     }
-                    Err(e) => {
-                        error!("Error checking package {}: {}", pkg_name, e);
-                        state.package_statuses[index] = PackageStatus::Error(e.to_string());
+
+                    let new_status = if exists {
+                        PackageStatus::Installed
+                    } else if !PackageManagerImpl::is_manager_installed(&pkg_manager) {
+                        PackageStatus::Error(format!(
+                            "Package not found and package manager '{pkg_manager:?}' is not installed"
+                        ))
+                    } else {
+                        PackageStatus::NotInstalled
+                    };
+
+                    if is_common {
+                        state.common_package_statuses[index] = new_status;
+                    } else {
+                        state.package_statuses[index] = new_status;
+                    }
+                }
+                Err(e) => {
+                    error!("Error checking package {}: {}", pkg_name, e);
+                    let err_status = PackageStatus::Error(e.to_string());
+                    if is_common {
+                        state.common_package_statuses[index] = err_status;
+                    } else {
+                        state.package_statuses[index] = err_status;
                     }
                 }
             }
 
-            // Store the index we just checked before clearing it
-            let checked_index = index;
             state.checking_index = None;
-
             info!(
-                "Finished checking selected package at index {}",
-                checked_index
+                "Finished checking package '{}' at index {}",
+                pkg_name, index
             );
             return Ok(());
         }
 
-        // STEP 2: Look for more work (next 'Unknown' package)
-        // This only runs for "check all" mode (when checking_index was None initially)
+        // STEP 2: Look for more work — common packages first, then profile packages.
+        if state.checking_is_common {
+            if let Some(index) = state
+                .common_package_statuses
+                .iter()
+                .position(|s| matches!(s, PackageStatus::Unknown))
+            {
+                state.checking_index = Some(index);
+                state.checking_is_common = true;
+                state.checking_delay_until =
+                    Some(std::time::Instant::now() + Duration::from_millis(10));
+                return Ok(());
+            }
+            // All common done — switch to profile packages
+            state.checking_is_common = false;
+        }
+
         if let Some(index) = state
             .package_statuses
             .iter()
             .position(|s| matches!(s, PackageStatus::Unknown))
         {
-            // Found work: Set checking_index so the loading icon shows for this package
             state.checking_index = Some(index);
-
-            // Schedule delay to let UI render the Loading icon for this index before we check it
+            state.checking_is_common = false;
             state.checking_delay_until =
                 Some(std::time::Instant::now() + Duration::from_millis(10));
             return Ok(());
@@ -271,16 +427,14 @@ impl ManagePackagesScreen {
         info!("Finished checking all packages");
 
         // Check if we just finished checking a newly added package
-        // If it's not installed, prompt the user to install it
         if let Some(new_idx) = state.newly_added_index.take() {
-            if let Some(status) = state.package_statuses.get(new_idx) {
-                if matches!(status, PackageStatus::NotInstalled) {
-                    info!(
-                        "Newly added package at index {} is not installed, prompting to install",
-                        new_idx
-                    );
-                    state.popup_type = PackagePopupType::InstallMissing;
-                }
+            let status = if state.is_adding_common {
+                state.common_package_statuses.get(new_idx)
+            } else {
+                state.package_statuses.get(new_idx)
+            };
+            if matches!(status, Some(PackageStatus::NotInstalled)) {
+                state.popup_type = PackagePopupType::InstallMissing;
             }
         }
 
@@ -297,6 +451,7 @@ impl ManagePackagesScreen {
         let state = &mut self.state;
         if let InstallationStep::Installing {
             package_index,
+            package_is_common,
             package_name,
             total_packages: _,
             packages_to_install: _,
@@ -315,14 +470,17 @@ impl ManagePackagesScreen {
                 // Start installation if not started (rx is None)
                 if status_rx.is_none() {
                     info!("Starting installation for package: {}", package_name);
-                    // Need to get the actual package
-                    let pkg = if let Some(p) = state.packages.get(*package_index) {
-                        p.clone()
+                    // Get the actual package from common or profile list
+                    let pkg = if *package_is_common {
+                        state.common_packages.get(*package_index).cloned()
                     } else {
-                        // Error case
+                        state.packages.get(*package_index).cloned()
+                    };
+                    let pkg = if let Some(p) = pkg {
+                        p
+                    } else {
                         error!("Package index {} out of bounds", package_index);
                         failed.push((*package_index, "Package index out of bounds".to_string()));
-                        // Move to next
                         self.advance_installation()?;
                         return Ok(());
                     };
@@ -356,22 +514,35 @@ impl ManagePackagesScreen {
                                         state
                                             .installation_output
                                             .push(format!("✅ Installed {package_name}"));
-                                        // Update status in list
-                                        if *package_index < state.package_statuses.len() {
-                                            state.package_statuses[*package_index] =
-                                                PackageStatus::Installed;
-                                        }
-
-                                        // Update cache
-                                        if !state.active_profile.is_empty() {
-                                            if let Err(e) = state.cache.update_status(
-                                                &state.active_profile,
+                                        // Update status in the correct list
+                                        if *package_is_common {
+                                            if *package_index < state.common_package_statuses.len()
+                                            {
+                                                state.common_package_statuses[*package_index] =
+                                                    PackageStatus::Installed;
+                                            }
+                                            let _ = state.cache.update_status(
+                                                "common",
                                                 package_name,
                                                 true,
                                                 None,
                                                 Some("Successfully installed".to_string()),
-                                            ) {
-                                                warn!("Failed to update package cache: {}", e);
+                                            );
+                                        } else {
+                                            if *package_index < state.package_statuses.len() {
+                                                state.package_statuses[*package_index] =
+                                                    PackageStatus::Installed;
+                                            }
+                                            if !state.active_profile.is_empty() {
+                                                if let Err(e) = state.cache.update_status(
+                                                    &state.active_profile,
+                                                    package_name,
+                                                    true,
+                                                    None,
+                                                    Some("Successfully installed".to_string()),
+                                                ) {
+                                                    warn!("Failed to update package cache: {}", e);
+                                                }
                                             }
                                         }
                                     } else {
@@ -454,16 +625,25 @@ impl ManagePackagesScreen {
             };
         } else {
             // Process next
-            let next_idx = next_packages[0];
+            let (next_idx, next_is_common) = next_packages[0];
             let remaining = next_packages[1..].to_vec();
-            let pkg_name = if let Some(p) = state.packages.get(next_idx) {
-                p.name.clone()
+            let pkg_name = if next_is_common {
+                state
+                    .common_packages
+                    .get(next_idx)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| "Unknown".to_string())
             } else {
-                "Unknown".to_string()
+                state
+                    .packages
+                    .get(next_idx)
+                    .map(|p| p.name.clone())
+                    .unwrap_or_else(|| "Unknown".to_string())
             };
 
             state.installation_step = InstallationStep::Installing {
                 package_index: next_idx,
+                package_is_common: next_is_common,
                 package_name: pkg_name,
                 total_packages: total,
                 packages_to_install: remaining,
@@ -488,9 +668,17 @@ impl Screen for ManagePackagesScreen {
 
         let config = ctx.config;
 
-        // Ensure list state is initialized if we have packages
-        if !self.state.packages.is_empty() && self.state.list_state.selected().is_none() {
-            self.state.list_state.select(Some(0));
+        // Ensure list state is initialized to the first non-header item
+        let has_packages =
+            !self.state.packages.is_empty() || !self.state.common_packages.is_empty();
+        if has_packages && self.state.list_state.selected().is_none() {
+            let display_items = self.build_display_items();
+            let first_pkg = display_items
+                .iter()
+                .position(|item| !matches!(item, DisplayItem::Header(_)));
+            if let Some(idx) = first_pkg {
+                self.state.list_state.select(Some(idx));
+            }
         }
 
         // Always render main content first (so dialogs can dim it)
@@ -527,9 +715,11 @@ impl Screen for ManagePackagesScreen {
         } else {
             let k = |a| config.keymap.get_key_display_for_action(a);
             format!(
-                "{}: Navigate | {}: Add | {}: Import | {}: Edit | {}: Delete | {}: Check | {}: Install | {}: Back",
+                "{}: Navigate | {}: Add | {}: Add Common | {}: Move | {}: Import | {}: Edit | {}: Delete | {}: Check | {}: Install | {}: Back",
                 config.keymap.navigation_display(),
                 k(crate::keymap::Action::Create),
+                k(crate::keymap::Action::CreateCommon),
+                k(crate::keymap::Action::Move),
                 k(crate::keymap::Action::Import),
                 k(crate::keymap::Action::Edit),
                 k(crate::keymap::Action::Delete),
@@ -785,6 +975,9 @@ impl ManagePackagesScreen {
     }
 
     fn handle_main_list_action(&mut self, action: Action) -> Result<ScreenAction> {
+        // Resolve which package (if any) is currently selected
+        let selected_item = self.get_selected_item();
+
         let state = &mut self.state;
         match action {
             Action::MoveUp => {
@@ -800,61 +993,60 @@ impl ManagePackagesScreen {
                 }
             }
             Action::Refresh => {
-                // Check All
-                if state.popup_type == PackagePopupType::None
-                    && !state.is_checking
-                    && !state.packages.is_empty()
+                // Check All (common + profile)
+                let has_packages = !state.packages.is_empty() || !state.common_packages.is_empty();
+                if state.popup_type == PackagePopupType::None && !state.is_checking && has_packages
                 {
-                    // Initialize check all
-                    if state.package_statuses.len() != state.packages.len() {
-                        state.package_statuses = vec![PackageStatus::Unknown; state.packages.len()];
-                    }
+                    state.common_package_statuses =
+                        vec![PackageStatus::Unknown; state.common_packages.len()];
                     state.package_statuses = vec![PackageStatus::Unknown; state.packages.len()];
                     state.is_checking = true;
                     state.checking_index = None;
+                    state.checking_is_common = true;
                     state.checking_delay_until =
                         Some(std::time::Instant::now() + Duration::from_millis(100));
                     return Ok(ScreenAction::Refresh);
                 }
             }
             Action::CheckStatus => {
-                // Check Selected
+                // Check selected package
                 if state.popup_type == PackagePopupType::None && !state.is_checking {
-                    if let Some(idx) = state.list_state.selected() {
-                        if idx < state.packages.len() {
-                            // Reset status for this one
-                            if state.package_statuses.len() != state.packages.len() {
-                                state.package_statuses =
-                                    vec![PackageStatus::Unknown; state.packages.len()];
-                            }
-                            state.package_statuses[idx] = PackageStatus::Unknown;
-                            state.is_checking = true;
-                            state.checking_index = Some(idx);
-                            // Mark that we're checking only the selected package (not all)
-                            // We'll use checking_index = Some(idx) to indicate "check selected" mode
-                            state.checking_delay_until =
-                                Some(std::time::Instant::now() + Duration::from_millis(100));
-                            return Ok(ScreenAction::Refresh);
+                    let (idx, is_common) = match selected_item {
+                        SelectedPackageItem::Common(i) => (i, true),
+                        SelectedPackageItem::Profile(i) => (i, false),
+                        _ => return Ok(ScreenAction::None),
+                    };
+                    if is_common {
+                        if state.common_package_statuses.len() != state.common_packages.len() {
+                            state.common_package_statuses =
+                                vec![PackageStatus::Unknown; state.common_packages.len()];
                         }
+                        state.common_package_statuses[idx] = PackageStatus::Unknown;
+                    } else {
+                        if state.package_statuses.len() != state.packages.len() {
+                            state.package_statuses =
+                                vec![PackageStatus::Unknown; state.packages.len()];
+                        }
+                        state.package_statuses[idx] = PackageStatus::Unknown;
                     }
+                    state.is_checking = true;
+                    state.checking_index = Some(idx);
+                    state.checking_is_common = is_common;
+                    state.checking_delay_until =
+                        Some(std::time::Instant::now() + Duration::from_millis(100));
+                    return Ok(ScreenAction::Refresh);
                 }
             }
             Action::Install => {
-                // Install Missing
+                // Install Missing (common + profile)
                 if state.popup_type == PackagePopupType::None && !state.is_checking {
-                    // Logic usually just starts installing.
-                    // We can check if any are missing and trigger the InstallMissingPackages action
-                    // which App will handle (or we handle internally if we can).
-                    // Wait, we moved 'process_installation_step' here. So we can start it here!
-                    // But we need to detect WHICH packages are missing.
-
                     let missing_count = state
                         .package_statuses
                         .iter()
+                        .chain(state.common_package_statuses.iter())
                         .filter(|s| matches!(s, PackageStatus::NotInstalled))
                         .count();
                     if missing_count > 0 {
-                        // Trigger installation logic
                         return Ok(ScreenAction::InstallMissingPackages);
                     }
                 }
@@ -865,25 +1057,53 @@ impl ManagePackagesScreen {
                     return Ok(ScreenAction::Refresh);
                 }
             }
+            Action::CreateCommon => {
+                if state.popup_type == PackagePopupType::None && !state.is_checking {
+                    self.start_add_common_package()?;
+                    return Ok(ScreenAction::Refresh);
+                }
+            }
             Action::Edit => {
                 if state.popup_type == PackagePopupType::None && !state.is_checking {
-                    if let Some(idx) = state.list_state.selected() {
-                        if idx < state.packages.len() {
-                            self.start_edit_package(idx)?;
+                    match selected_item {
+                        SelectedPackageItem::Common(i) => {
+                            self.start_edit_common_package(i)?;
                             return Ok(ScreenAction::Refresh);
                         }
+                        SelectedPackageItem::Profile(i) => {
+                            self.start_edit_package(i)?;
+                            return Ok(ScreenAction::Refresh);
+                        }
+                        _ => {}
                     }
                 }
             }
             Action::Delete => {
                 if state.popup_type == PackagePopupType::None && !state.is_checking {
-                    if let Some(idx) = state.list_state.selected() {
-                        if idx < state.packages.len() {
-                            state.delete_index = Some(idx);
+                    match selected_item {
+                        SelectedPackageItem::Common(i) | SelectedPackageItem::Profile(i) => {
+                            let is_common = matches!(selected_item, SelectedPackageItem::Common(_));
+                            state.delete_index = Some(i);
+                            state.is_adding_common = is_common;
                             state.popup_type = PackagePopupType::Delete;
                             state.delete_confirm_input.clear();
                             return Ok(ScreenAction::Refresh);
                         }
+                        _ => {}
+                    }
+                }
+            }
+            Action::Move => {
+                // Move selected package to/from common
+                if state.popup_type == PackagePopupType::None && !state.is_checking {
+                    match selected_item {
+                        SelectedPackageItem::Profile(i) => {
+                            return Ok(ScreenAction::MovePackageToCommon { index: i });
+                        }
+                        SelectedPackageItem::Common(i) => {
+                            return Ok(ScreenAction::MovePackageFromCommon { index: i });
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -910,6 +1130,7 @@ impl ManagePackagesScreen {
 
     fn start_add_package(&mut self) -> Result<()> {
         let state = &mut self.state;
+        state.is_adding_common = false;
         state.popup_type = PackagePopupType::Add;
         state.add_editing_index = None;
         state.add_validation_error = None;
@@ -935,8 +1156,58 @@ impl ManagePackagesScreen {
         Ok(())
     }
 
+    fn start_add_common_package(&mut self) -> Result<()> {
+        self.start_add_package()?;
+        self.state.is_adding_common = true;
+        Ok(())
+    }
+
+    fn start_edit_common_package(&mut self, index: usize) -> Result<()> {
+        let state = &mut self.state;
+        if let Some(pkg) = state.common_packages.get(index).cloned() {
+            state.is_adding_common = true;
+            state.popup_type = PackagePopupType::Edit;
+            state.add_editing_index = Some(index);
+            state.add_validation_error = None;
+            state.add_name_input = crate::utils::TextInput::with_text(&pkg.name);
+            state.add_description_input =
+                crate::utils::TextInput::with_text(pkg.description.clone().unwrap_or_default());
+            state.add_package_name_input =
+                crate::utils::TextInput::with_text(pkg.package_name.clone().unwrap_or_default());
+            state.add_binary_name_input = crate::utils::TextInput::with_text(&pkg.binary_name);
+            state.add_install_command_input =
+                crate::utils::TextInput::with_text(pkg.install_command.clone().unwrap_or_default());
+            state.add_existence_check_input =
+                crate::utils::TextInput::with_text(pkg.existence_check.clone().unwrap_or_default());
+            state.add_manager_check_input =
+                crate::utils::TextInput::with_text(pkg.manager_check.clone().unwrap_or_default());
+
+            state.available_managers = PackageManagerImpl::get_available_managers();
+            state.add_manager = Some(pkg.manager.clone());
+            state.add_is_custom = matches!(
+                pkg.manager,
+                crate::utils::profile_manifest::PackageManager::Custom
+            );
+            if let Some(pos) = state
+                .available_managers
+                .iter()
+                .position(|m| *m == pkg.manager)
+            {
+                state.add_manager_selected = pos;
+            } else {
+                state.add_manager_selected = 0;
+            }
+            state
+                .manager_list_state
+                .select(Some(state.add_manager_selected));
+            state.add_focused_field = AddPackageField::Name;
+        }
+        Ok(())
+    }
+
     fn start_edit_package(&mut self, index: usize) -> Result<()> {
         let state = &mut self.state;
+        state.is_adding_common = false;
         if let Some(pkg) = state.packages.get(index) {
             state.popup_type = PackagePopupType::Edit;
             state.add_editing_index = Some(index);
@@ -1104,11 +1375,12 @@ impl ManagePackagesScreen {
                         // Just started, keep waiting
                     }
                     DiscoveryStatus::Complete { source, packages } => {
-                        // Filter out packages that are already added (by binary name)
+                        // Filter out packages that are already added (by binary name) in either list
                         let existing_binaries: std::collections::HashSet<String> = self
                             .state
                             .packages
                             .iter()
+                            .chain(self.state.common_packages.iter())
                             .map(|p| p.binary_name.to_lowercase())
                             .collect();
 
@@ -1341,15 +1613,24 @@ impl ManagePackagesScreen {
                             return Ok(ScreenAction::Refresh);
                         }
 
-                        // Check for duplicate binary name
+                        // Check for duplicate binary name across both common and profile lists
                         let binary_name_lower = binary_name.trim().to_lowercase();
-                        let duplicate = self.state.packages.iter().enumerate().any(|(idx, pkg)| {
-                            // Skip the package being edited
-                            if edit_idx == Some(idx) {
-                                return false;
-                            }
-                            pkg.binary_name.to_lowercase() == binary_name_lower
-                        });
+                        let editing_common = state.is_adding_common;
+                        let duplicate_in_profile =
+                            state.packages.iter().enumerate().any(|(idx, pkg)| {
+                                if !editing_common && edit_idx == Some(idx) {
+                                    return false; // Skip the package being edited
+                                }
+                                pkg.binary_name.to_lowercase() == binary_name_lower
+                            });
+                        let duplicate_in_common =
+                            state.common_packages.iter().enumerate().any(|(idx, pkg)| {
+                                if editing_common && edit_idx == Some(idx) {
+                                    return false; // Skip the package being edited
+                                }
+                                pkg.binary_name.to_lowercase() == binary_name_lower
+                            });
+                        let duplicate = duplicate_in_profile || duplicate_in_common;
 
                         if duplicate {
                             warn!(
@@ -1376,33 +1657,61 @@ impl ManagePackagesScreen {
                             manager_check: &manager_check,
                         });
 
-                        // Save
+                        // Save to the correct scope (common or profile)
                         let repo_path = &config.repo_path;
-                        let active_profile = &config.active_profile;
+                        let active_profile = config.active_profile.clone();
                         let is_new_package = edit_idx.is_none();
-                        let packages = if let Some(idx) = edit_idx {
-                            PackageService::update_package(repo_path, active_profile, idx, package)?
-                        } else {
-                            PackageService::add_package(repo_path, active_profile, package)?
-                        };
+                        let is_common = self.state.is_adding_common;
 
-                        // Track newly added package to prompt install after check
-                        let new_package_index = if is_new_package {
-                            Some(packages.len() - 1)
-                        } else {
-                            None
-                        };
-
-                        self.update_packages(packages, active_profile);
-
-                        // Force newly added package to Unknown status so it gets checked
-                        // (update_packages may have loaded a stale status from cache)
-                        if let Some(idx) = new_package_index {
-                            if idx < self.state.package_statuses.len() {
-                                self.state.package_statuses[idx] = PackageStatus::Unknown;
+                        if is_common {
+                            let common_packages = if let Some(idx) = edit_idx {
+                                PackageService::update_common_package(repo_path, idx, package)?
+                            } else {
+                                PackageService::add_common_package(repo_path, package)?
+                            };
+                            let new_pkg_idx = if is_new_package {
+                                Some(common_packages.len() - 1)
+                            } else {
+                                None
+                            };
+                            let profile_packages = self.state.packages.clone();
+                            self.update_all_packages(
+                                common_packages,
+                                profile_packages,
+                                &active_profile,
+                            );
+                            if let Some(idx) = new_pkg_idx {
+                                if idx < self.state.common_package_statuses.len() {
+                                    self.state.common_package_statuses[idx] =
+                                        PackageStatus::Unknown;
+                                }
+                                self.state.newly_added_index = Some(idx);
                             }
-                            self.state.newly_added_index = Some(idx);
-                        }
+                        } else {
+                            let packages = if let Some(idx) = edit_idx {
+                                PackageService::update_package(
+                                    repo_path,
+                                    &active_profile,
+                                    idx,
+                                    package,
+                                )?
+                            } else {
+                                PackageService::add_package(repo_path, &active_profile, package)?
+                            };
+                            let new_pkg_idx = if is_new_package {
+                                Some(packages.len() - 1)
+                            } else {
+                                None
+                            };
+                            let common_packages = self.state.common_packages.clone();
+                            self.update_all_packages(common_packages, packages, &active_profile);
+                            if let Some(idx) = new_pkg_idx {
+                                if idx < self.state.package_statuses.len() {
+                                    self.state.package_statuses[idx] = PackageStatus::Unknown;
+                                }
+                                self.state.newly_added_index = Some(idx);
+                            }
+                        };
 
                         self.reset_state();
                         // Trigger check for the new/updated package
@@ -1651,27 +1960,46 @@ impl ManagePackagesScreen {
                 Action::Confirm => {
                     if state.delete_confirm_input.text().trim() == "DELETE" {
                         if let Some(idx) = state.delete_index {
-                            // Get package name before deletion to remove from cache
-                            let package_name = state.packages.get(idx).map(|p| p.name.clone());
-
-                            let packages = PackageService::delete_package(
-                                &config.repo_path,
-                                &config.active_profile,
-                                idx,
-                            )?;
-
-                            // Remove from cache
-                            if let Some(name) = package_name {
-                                if let Err(e) = self
-                                    .state
-                                    .cache
-                                    .remove_status(&config.active_profile, &name)
-                                {
-                                    warn!("Failed to remove package from cache: {}", e);
+                            let is_common = state.is_adding_common;
+                            if is_common {
+                                let pkg_name =
+                                    state.common_packages.get(idx).map(|p| p.name.clone());
+                                let common_packages =
+                                    PackageService::delete_common_package(&config.repo_path, idx)?;
+                                if let Some(name) = pkg_name {
+                                    let _ = self.state.cache.remove_status("common", &name);
                                 }
+                                let profile_packages = self.state.packages.clone();
+                                let active = config.active_profile.clone();
+                                self.update_all_packages(
+                                    common_packages,
+                                    profile_packages,
+                                    &active,
+                                );
+                            } else {
+                                let pkg_name = state.packages.get(idx).map(|p| p.name.clone());
+                                let profile_packages = PackageService::delete_package(
+                                    &config.repo_path,
+                                    &config.active_profile,
+                                    idx,
+                                )?;
+                                if let Some(name) = pkg_name {
+                                    if let Err(e) = self
+                                        .state
+                                        .cache
+                                        .remove_status(&config.active_profile, &name)
+                                    {
+                                        warn!("Failed to remove package from cache: {}", e);
+                                    }
+                                }
+                                let common_packages = self.state.common_packages.clone();
+                                let active = config.active_profile.clone();
+                                self.update_all_packages(
+                                    common_packages,
+                                    profile_packages,
+                                    &active,
+                                );
                             }
-
-                            self.update_packages(packages, &config.active_profile);
                             self.reset_state();
                             return Ok(ScreenAction::Refresh);
                         }
@@ -2030,8 +2358,9 @@ impl ManagePackagesScreen {
             });
 
             match PackageService::add_package(&config.repo_path, &config.active_profile, package) {
-                Ok(packages) => {
-                    self.update_packages(packages, &config.active_profile);
+                Ok(profile_packages) => {
+                    let common = self.state.common_packages.clone();
+                    self.update_all_packages(common, profile_packages, &config.active_profile);
                     packages_imported = true;
                 }
                 Err(e) => {
@@ -2069,6 +2398,55 @@ impl ManagePackagesScreen {
     }
 }
 
+/// Free helper: render a single package row for the package list.
+fn render_package_list_item<'a>(
+    package: &'a Package,
+    status: Option<&PackageStatus>,
+    is_checking_this: bool,
+    inner_width: usize,
+    icons: &crate::icons::Icons,
+    t: &crate::styles::Theme,
+) -> ListItem<'a> {
+    let status_icon = match status {
+        Some(PackageStatus::Installed) => icons.success(),
+        Some(PackageStatus::NotInstalled) => icons.error(),
+        Some(PackageStatus::Error(_)) => icons.warning(),
+        _ => {
+            if is_checking_this {
+                icons.loading()
+            } else {
+                " "
+            }
+        }
+    };
+
+    let manager_str = format!("{:?}", package.manager);
+    let manager_len = manager_str.chars().count();
+    let status_char_count = status_icon.chars().count();
+    let name_char_count = package.name.chars().count();
+    let used_width = status_char_count + 1 + name_char_count + 1 + manager_len;
+    let padding = " ".repeat(inner_width.saturating_sub(used_width));
+
+    let style = match status {
+        Some(PackageStatus::Installed) => Style::default().fg(t.success),
+        Some(PackageStatus::NotInstalled) => Style::default().fg(t.error),
+        Some(PackageStatus::Error(_)) => Style::default().fg(t.warning),
+        _ => Style::default(),
+    };
+
+    let line = Line::from(vec![
+        Span::styled(status_icon, style),
+        Span::styled(" ", style),
+        Span::styled(&package.name, style),
+        Span::raw(padding),
+        Span::styled(
+            format!(" {manager_str}"),
+            Style::default().italic().fg(t.text_dimmed),
+        ),
+    ]);
+    ListItem::new(line)
+}
+
 // Rendering methods inlined from PackageManagerComponent
 impl ManagePackagesScreen {
     fn render_package_list(
@@ -2078,11 +2456,12 @@ impl ManagePackagesScreen {
         config: &Config,
     ) -> Result<()> {
         let t = theme();
+        let has_packages =
+            !self.state.packages.is_empty() || !self.state.common_packages.is_empty();
 
-        if self.state.packages.is_empty() {
-            // Show empty state message
+        if !has_packages {
             let paragraph = Paragraph::new(format!(
-                "No packages yet.\n\nPress '{}' to add your first package.",
+                "No packages yet.\n\nPress \'{}\' to add your first package.",
                 config
                     .keymap
                     .get_key_display_for_action(crate::keymap::Action::Create)
@@ -2098,93 +2477,90 @@ impl ManagePackagesScreen {
             .wrap(Wrap { trim: true })
             .alignment(Alignment::Center);
             frame.render_widget(paragraph, area);
-        } else {
-            let items: Vec<ListItem> = self
-                .state
-                .packages
-                .iter()
-                .enumerate()
-                .map(|(idx, package)| {
-                    let icons = crate::icons::Icons::from_config(config);
-                    let status_icon = match self.state.package_statuses.get(idx) {
-                        Some(PackageStatus::Installed) => icons.success(),
-                        Some(PackageStatus::NotInstalled) => icons.error(),
-                        Some(PackageStatus::Error(_)) => icons.warning(),
-                        _ => {
-                            if self.state.is_checking && self.state.checking_index == Some(idx) {
-                                icons.loading()
-                            } else {
-                                " "
-                            }
-                        }
-                    };
+            return Ok(());
+        }
 
-                    let manager_str = format!("{:?}", package.manager);
-                    let manager_len = manager_str.chars().count();
+        let display_items = self.build_display_items();
+        let icons = crate::icons::Icons::from_config(config);
+        let inner_width = area.width.saturating_sub(4) as usize;
 
-                    // Approximate widths (assume ascii mostly)
-                    let status_char_count = status_icon.chars().count();
-                    let name_char_count = package.name.chars().count();
-
-                    // Available width: Area width - borders (2) - highlight symbol (2)
-                    let inner_width = area.width.saturating_sub(4) as usize;
-
-                    // Calculate padding
-                    let used_width = status_char_count + 1 + name_char_count + 1 + manager_len; // +1s for spaces
-                    let padding_len = inner_width.saturating_sub(used_width);
-                    let padding = " ".repeat(padding_len);
-
-                    let style = match self.state.package_statuses.get(idx) {
-                        Some(PackageStatus::Installed) => Style::default().fg(t.success),
-                        Some(PackageStatus::NotInstalled) => Style::default().fg(t.error),
-                        Some(PackageStatus::Error(_)) => Style::default().fg(t.warning),
-                        _ => Style::default(),
-                    };
-
-                    let line = Line::from(vec![
-                        Span::styled(status_icon, style),
-                        Span::styled(" ", style),
-                        Span::styled(&package.name, style),
-                        Span::raw(padding),
-                        Span::styled(
-                            format!(" {manager_str}"),
-                            Style::default().italic().fg(t.text_dimmed),
-                        ),
-                    ]);
-
+        let items: Vec<ListItem> = display_items
+            .iter()
+            .map(|item| match item {
+                DisplayItem::Header(title) => {
+                    let line = Line::from(vec![Span::styled(
+                        format!(" {title} "),
+                        Style::default()
+                            .fg(t.text_dimmed)
+                            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                    )]);
                     ListItem::new(line)
-                })
-                .collect();
-
-            let list = List::new(items)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(theme().border_type(false))
-                        .title(" Packages ")
-                        .border_style(focused_border_style()),
-                )
-                .highlight_style(t.highlight_style())
-                .highlight_symbol(LIST_HIGHLIGHT_SYMBOL);
-
-            frame.render_stateful_widget(list, area, &mut self.state.list_state);
-
-            // Populate mouse regions
-            self.list_pane_area = Some(area);
-            self.mouse_regions.clear();
-            let inner = Block::default().borders(Borders::ALL).inner(area);
-            let scroll_offset = self.state.list_state.offset();
-            for i in 0..self.state.packages.len() {
-                if i < scroll_offset {
-                    continue;
                 }
-                let visible_row = (i - scroll_offset) as u16;
-                if visible_row >= inner.height {
-                    break;
+                DisplayItem::PackageCommon(idx) => {
+                    let package = &self.state.common_packages[*idx];
+                    let status = self.state.common_package_statuses.get(*idx);
+                    let is_checking_this = self.state.is_checking
+                        && self.state.checking_is_common
+                        && self.state.checking_index == Some(*idx);
+                    render_package_list_item(
+                        package,
+                        status,
+                        is_checking_this,
+                        inner_width,
+                        &icons,
+                        &t,
+                    )
                 }
-                let row_area = Rect::new(inner.x, inner.y + visible_row, inner.width, 1);
-                self.mouse_regions.add(row_area, i);
+                DisplayItem::PackageProfile(idx) => {
+                    let package = &self.state.packages[*idx];
+                    let status = self.state.package_statuses.get(*idx);
+                    let is_checking_this = self.state.is_checking
+                        && !self.state.checking_is_common
+                        && self.state.checking_index == Some(*idx);
+                    render_package_list_item(
+                        package,
+                        status,
+                        is_checking_this,
+                        inner_width,
+                        &icons,
+                        &t,
+                    )
+                }
+            })
+            .collect();
+
+        let common_count = self.state.common_packages.len();
+        let profile_count = self.state.packages.len();
+        let title = format!(" Packages ({common_count} common, {profile_count} profile) ");
+
+        let list = List::new(items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(t.border_type(false))
+                    .title(title)
+                    .border_style(focused_border_style()),
+            )
+            .highlight_style(t.highlight_style())
+            .highlight_symbol(LIST_HIGHLIGHT_SYMBOL);
+
+        frame.render_stateful_widget(list, area, &mut self.state.list_state);
+
+        // Populate mouse regions (map display-item row -> display-item index)
+        self.list_pane_area = Some(area);
+        self.mouse_regions.clear();
+        let inner = Block::default().borders(Borders::ALL).inner(area);
+        let scroll_offset = self.state.list_state.offset();
+        for (display_idx, _item) in display_items.iter().enumerate() {
+            if display_idx < scroll_offset {
+                continue;
             }
+            let visible_row = (display_idx - scroll_offset) as u16;
+            if visible_row >= inner.height {
+                break;
+            }
+            let row_area = Rect::new(inner.x, inner.y + visible_row, inner.width, 1);
+            self.mouse_regions.add(row_area, display_idx);
         }
 
         Ok(())
@@ -2196,15 +2572,24 @@ impl ManagePackagesScreen {
         area: Rect,
         config: &Config,
     ) -> Result<()> {
-        let selected = self.state.list_state.selected();
-        let details = if let Some(idx) = selected {
-            if let Some(package) = self.state.packages.get(idx) {
-                self.format_package_details(package, idx, config)
-            } else {
-                vec![Line::from("No package selected")]
+        let details = match self.get_selected_item() {
+            SelectedPackageItem::Common(i) => {
+                if let Some(package) = self.state.common_packages.get(i) {
+                    let pkg = package.clone();
+                    self.format_package_details(&pkg, i, true, config)
+                } else {
+                    vec![Line::from("No package selected")]
+                }
             }
-        } else {
-            vec![Line::from("No package selected")]
+            SelectedPackageItem::Profile(i) => {
+                if let Some(package) = self.state.packages.get(i) {
+                    let pkg = package.clone();
+                    self.format_package_details(&pkg, i, false, config)
+                } else {
+                    vec![Line::from("No package selected")]
+                }
+            }
+            _ => vec![Line::from("No package selected")],
         };
 
         let paragraph = Paragraph::new(details)
@@ -2229,6 +2614,7 @@ impl ManagePackagesScreen {
         &self,
         package: &Package,
         idx: usize,
+        is_common: bool,
         config: &Config,
     ) -> Vec<Line<'_>> {
         let t = theme();
@@ -2268,7 +2654,11 @@ impl ManagePackagesScreen {
 
         // Status
         lines.push(Line::from(""));
-        let status = self.state.package_statuses.get(idx);
+        let status = if is_common {
+            self.state.common_package_statuses.get(idx)
+        } else {
+            self.state.package_statuses.get(idx)
+        };
         match status {
             Some(PackageStatus::Installed) => {
                 lines.push(Line::from(vec![
@@ -2334,11 +2724,12 @@ impl ManagePackagesScreen {
         }
 
         // Cache details
-        if let Some(entry) = self
-            .state
-            .cache
-            .get_status(&self.state.active_profile, &package.name)
-        {
+        let cache_profile = if is_common {
+            "common".to_string()
+        } else {
+            self.state.active_profile.clone()
+        };
+        if let Some(entry) = self.state.cache.get_status(&cache_profile, &package.name) {
             lines.push(Line::from(""));
             lines.push(Line::from(""));
             lines.push(Line::from(vec![Span::styled(

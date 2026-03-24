@@ -21,16 +21,19 @@ pub enum PackagesCommand {
     /// List packages for a profile
     List {
         /// Target profile (defaults to active profile)
-        #[arg(short, long)]
+        #[arg(short, long, conflicts_with = "common")]
         profile: Option<String>,
         /// Show detailed package information
         #[arg(short, long)]
         verbose: bool,
+        /// List common packages (shared across all profiles)
+        #[arg(long)]
+        common: bool,
     },
     /// Add a package to a profile
     Add {
         /// Target profile (defaults to active profile)
-        #[arg(short, long)]
+        #[arg(short, long, conflicts_with = "common")]
         profile: Option<String>,
         /// Package display name
         #[arg(short, long)]
@@ -53,32 +56,44 @@ pub enum PackagesCommand {
         /// Command to check if package exists (optional, for custom)
         #[arg(long)]
         existence_check: Option<String>,
+        /// Add to common packages (shared across all profiles)
+        #[arg(long)]
+        common: bool,
     },
     /// Remove a package from a profile
     Remove {
         /// Target profile (defaults to active profile)
-        #[arg(short, long)]
+        #[arg(short, long, conflicts_with = "common")]
         profile: Option<String>,
         /// Skip confirmation prompt
         #[arg(short, long)]
         yes: bool,
         /// Package name to remove
         name: Option<String>,
+        /// Remove from common packages (shared across all profiles)
+        #[arg(long)]
+        common: bool,
     },
     /// Check installation status of packages
     Check {
         /// Target profile (defaults to active profile)
-        #[arg(short, long)]
+        #[arg(short, long, conflicts_with = "common")]
         profile: Option<String>,
+        /// Check common packages (shared across all profiles)
+        #[arg(long)]
+        common: bool,
     },
     /// Install all missing packages
     Install {
         /// Target profile (defaults to active profile)
-        #[arg(short, long)]
+        #[arg(short, long, conflicts_with = "common")]
         profile: Option<String>,
         /// Show package manager output
         #[arg(short, long)]
         verbose: bool,
+        /// Install missing common packages (shared across all profiles)
+        #[arg(long)]
+        common: bool,
     },
     /// Show help for packages commands
     Help {
@@ -90,7 +105,11 @@ pub enum PackagesCommand {
 /// Execute a packages subcommand.
 pub fn execute(command: PackagesCommand) -> Result<()> {
     match command {
-        PackagesCommand::List { profile, verbose } => cmd_list(profile, verbose),
+        PackagesCommand::List {
+            profile,
+            verbose,
+            common,
+        } => cmd_list(profile, verbose, common),
         PackagesCommand::Add {
             profile,
             name,
@@ -100,6 +119,7 @@ pub fn execute(command: PackagesCommand) -> Result<()> {
             package_name,
             install_command,
             existence_check,
+            common,
         } => cmd_add(
             profile,
             name,
@@ -109,10 +129,20 @@ pub fn execute(command: PackagesCommand) -> Result<()> {
             package_name,
             install_command,
             existence_check,
+            common,
         ),
-        PackagesCommand::Remove { profile, yes, name } => cmd_remove(profile, yes, name),
-        PackagesCommand::Check { profile } => cmd_check(profile),
-        PackagesCommand::Install { profile, verbose } => cmd_install(profile, verbose),
+        PackagesCommand::Remove {
+            profile,
+            yes,
+            name,
+            common,
+        } => cmd_remove(profile, yes, name, common),
+        PackagesCommand::Check { profile, common } => cmd_check(profile, common),
+        PackagesCommand::Install {
+            profile,
+            verbose,
+            common,
+        } => cmd_install(profile, verbose, common),
         PackagesCommand::Help { command } => cmd_help(command),
     }
 }
@@ -210,10 +240,15 @@ fn cmd_help(command: Option<String>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_list(profile: Option<String>, verbose: bool) -> Result<()> {
+fn cmd_list(profile: Option<String>, verbose: bool, common: bool) -> Result<()> {
     use crate::utils::package_cache::PackageCache;
 
     let ctx = CliContext::load()?;
+
+    if common {
+        return cmd_list_common(verbose, &ctx);
+    }
+
     let profile_name = ctx.resolve_profile(profile.as_deref());
 
     // Validate profile exists
@@ -330,6 +365,67 @@ fn cmd_list(profile: Option<String>, verbose: bool) -> Result<()> {
     Ok(())
 }
 
+fn cmd_list_common(verbose: bool, ctx: &CliContext) -> Result<()> {
+    use crate::utils::package_cache::PackageCache;
+
+    let packages = PackageService::get_common_packages(&ctx.config.repo_path)?;
+    let mut cache = PackageCache::new().unwrap_or_default();
+
+    if packages.is_empty() {
+        println!("No common packages configured.");
+        println!("Use 'dotstate packages add --common' to add shared packages.");
+        return Ok(());
+    }
+
+    println!("Common packages (shared across all profiles):\n");
+
+    let mut installed_count = 0;
+    let mut missing_count = 0;
+
+    for package in &packages {
+        let manager_str = format!("{:?}", package.manager).to_lowercase();
+        let result = PackageService::check_package(package);
+        let (installed, status_str) = match result.status {
+            PackageCheckStatus::Installed => {
+                installed_count += 1;
+                (Some(true), "\u{2713} installed".to_string())
+            }
+            PackageCheckStatus::NotInstalled => {
+                missing_count += 1;
+                (Some(false), "\u{2717} not installed".to_string())
+            }
+            PackageCheckStatus::Error(ref e) => (None, format!("? {e}")),
+            PackageCheckStatus::Unknown => (None, "? unknown".to_string()),
+        };
+        if let Some(is_installed) = installed {
+            let _ = cache.update_status("common", &package.name, is_installed, None, None);
+        }
+        if verbose {
+            println!("  {}", package.name);
+            println!("    Manager: {manager_str}");
+            if let Some(ref pkg_name) = package.package_name {
+                println!("    Package: {pkg_name}");
+            }
+            println!("    Binary: {}", package.binary_name);
+            if let Some(ref desc) = package.description {
+                println!("    Description: {desc}");
+            }
+            println!("    Status: {status_str}");
+            println!();
+        } else {
+            println!("  {:<12} {:<8} {}", package.name, manager_str, status_str);
+        }
+    }
+
+    println!(
+        "\n{} common packages ({} installed, {} missing)",
+        packages.len(),
+        installed_count,
+        missing_count
+    );
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_add(
     profile: Option<String>,
@@ -340,8 +436,23 @@ fn cmd_add(
     package_name: Option<String>,
     install_command: Option<String>,
     existence_check: Option<String>,
+    common: bool,
 ) -> Result<()> {
     let ctx = CliContext::load()?;
+
+    if common {
+        return cmd_add_common(
+            name,
+            manager,
+            binary,
+            description,
+            package_name,
+            install_command,
+            existence_check,
+            &ctx,
+        );
+    }
+
     let profile_name = ctx.resolve_profile(profile.as_deref());
 
     // Validate profile exists
@@ -466,8 +577,127 @@ fn cmd_add(
     Ok(())
 }
 
-fn cmd_remove(profile: Option<String>, yes: bool, name: Option<String>) -> Result<()> {
+fn cmd_add_common(
+    name: Option<String>,
+    manager: Option<String>,
+    binary: Option<String>,
+    description: Option<String>,
+    package_name: Option<String>,
+    install_command: Option<String>,
+    existence_check: Option<String>,
+    ctx: &CliContext,
+) -> Result<()> {
+    let existing = PackageService::get_common_packages(&ctx.config.repo_path)?;
+
+    let name = match name {
+        Some(n) => n,
+        None => prompt_string("Name", None)?,
+    };
+
+    if existing.iter().any(|p| p.name == name) {
+        print_error(&format!("Common package '{name}' already exists"));
+        std::process::exit(1);
+    }
+
+    let manager = match manager {
+        Some(m) => parse_manager(&m).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Invalid manager '{m}'. Valid: brew, apt, cargo, npm, pip, custom, etc."
+            )
+        })?,
+        None => prompt_manager(true)?,
+    };
+
+    let is_custom = matches!(
+        manager,
+        crate::utils::profile_manifest::PackageManager::Custom
+    );
+
+    let binary = match binary {
+        Some(b) => b,
+        None => prompt_string("Binary name", None)?,
+    };
+
+    let pkg_name = if is_custom {
+        String::new()
+    } else {
+        match package_name {
+            Some(p) => p,
+            None => prompt_string("Package name in manager", Some(&binary))?,
+        }
+    };
+
+    let install_cmd = if is_custom {
+        match install_command {
+            Some(c) => c,
+            None => prompt_string("Install command", None)?,
+        }
+    } else {
+        String::new()
+    };
+
+    let exist_check = if is_custom {
+        match existence_check {
+            Some(c) => Some(c),
+            None => prompt_string_optional("Existence check")?,
+        }
+    } else {
+        None
+    };
+
+    let desc = match description {
+        Some(d) => d,
+        None => prompt_string_optional("Description")?.unwrap_or_default(),
+    };
+
+    let validation = PackageService::validate_package(
+        &name,
+        &binary,
+        is_custom,
+        &pkg_name,
+        &install_cmd,
+        Some(&manager),
+    );
+    if !validation.is_valid {
+        print_error(
+            &validation
+                .error_message
+                .unwrap_or_else(|| "Validation failed".to_string()),
+        );
+        std::process::exit(1);
+    }
+
+    let package = PackageService::create_package(PackageCreationParams {
+        name: &name,
+        description: &desc,
+        manager: manager.clone(),
+        is_custom,
+        package_name: &pkg_name,
+        binary_name: &binary,
+        install_command: &install_cmd,
+        existence_check: exist_check.as_deref().unwrap_or(""),
+        manager_check: "",
+    });
+
+    PackageService::add_common_package(&ctx.config.repo_path, package)?;
+    print_success(&format!(
+        "Common package '{name}' added (shared across all profiles)"
+    ));
+    Ok(())
+}
+
+fn cmd_remove(
+    profile: Option<String>,
+    yes: bool,
+    name: Option<String>,
+    common: bool,
+) -> Result<()> {
     let ctx = CliContext::load()?;
+
+    if common {
+        return cmd_remove_common(yes, name, &ctx);
+    }
+
     let profile_name = ctx.resolve_profile(profile.as_deref());
 
     // Validate profile exists
@@ -537,10 +767,50 @@ fn cmd_remove(profile: Option<String>, yes: bool, name: Option<String>) -> Resul
     Ok(())
 }
 
-fn cmd_check(profile: Option<String>) -> Result<()> {
+fn cmd_remove_common(yes: bool, name: Option<String>, ctx: &CliContext) -> Result<()> {
+    let packages = PackageService::get_common_packages(&ctx.config.repo_path)?;
+
+    if packages.is_empty() {
+        println!("No common packages found.");
+        return Ok(());
+    }
+
+    let (index, package_name) = if let Some(ref n) = name {
+        if let Some(i) = packages.iter().position(|p| p.name == *n) {
+            (i, n.clone())
+        } else {
+            print_error(&format!("Common package '{n}' not found"));
+            std::process::exit(1);
+        }
+    } else {
+        println!("Select common package to remove:\n");
+        let options: Vec<(&str, Option<&str>)> =
+            packages.iter().map(|p| (p.name.as_str(), None)).collect();
+        let selected = prompt_select_with_suffix("Package", &options)?;
+        (selected, packages[selected].name.clone())
+    };
+
+    if !yes {
+        if !prompt_confirm(&format!("Remove common package '{package_name}'?"))? {
+            println!("Cancelled.");
+            return Ok(());
+        }
+    }
+
+    PackageService::delete_common_package(&ctx.config.repo_path, index)?;
+    print_success(&format!("Common package '{package_name}' removed"));
+    Ok(())
+}
+
+fn cmd_check(profile: Option<String>, common: bool) -> Result<()> {
     use crate::utils::package_cache::PackageCache;
 
     let ctx = CliContext::load()?;
+
+    if common {
+        return cmd_check_common(&ctx);
+    }
+
     let profile_name = ctx.resolve_profile(profile.as_deref());
 
     // Validate profile exists
@@ -632,12 +902,75 @@ fn cmd_check(profile: Option<String>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_install(profile: Option<String>, verbose: bool) -> Result<()> {
+fn cmd_check_common(ctx: &CliContext) -> Result<()> {
+    use crate::utils::package_cache::PackageCache;
+
+    let packages = PackageService::get_common_packages(&ctx.config.repo_path)?;
+
+    if packages.is_empty() {
+        println!("No common packages configured.");
+        return Ok(());
+    }
+
+    let mut cache = PackageCache::new().unwrap_or_default();
+    println!("Checking common packages (shared across all profiles)...\n");
+
+    let mut installed = 0;
+    let mut not_installed = 0;
+    let mut errors = 0;
+
+    for package in &packages {
+        let manager_str = format!("{:?}", package.manager).to_lowercase();
+        let result = PackageService::check_package(package);
+        let (is_installed, status_str) = match result.status {
+            PackageCheckStatus::Installed => {
+                installed += 1;
+                (Some(true), "\u{2713} installed")
+            }
+            PackageCheckStatus::NotInstalled => {
+                not_installed += 1;
+                (Some(false), "\u{2717} not installed")
+            }
+            PackageCheckStatus::Error(ref e) => {
+                errors += 1;
+                println!("  {:<12} {:<8} ? {}", package.name, manager_str, e);
+                continue;
+            }
+            PackageCheckStatus::Unknown => {
+                errors += 1;
+                (None, "? unknown")
+            }
+        };
+        if let Some(v) = is_installed {
+            let _ = cache.update_status("common", &package.name, v, None, None);
+        }
+        println!("  {:<12} {:<8} {}", package.name, manager_str, status_str);
+    }
+
+    println!();
+    println!(
+        "{} of {} common packages installed ({} missing)",
+        installed,
+        packages.len(),
+        not_installed
+    );
+    if errors > 0 {
+        println!("({errors} check errors)");
+    }
+    Ok(())
+}
+
+fn cmd_install(profile: Option<String>, verbose: bool, common: bool) -> Result<()> {
     use crate::utils::package_installer::PackageInstaller;
     use std::sync::mpsc;
     use std::thread;
 
     let ctx = CliContext::load()?;
+
+    if common {
+        return cmd_install_common(verbose, &ctx);
+    }
+
     let profile_name = ctx.resolve_profile(profile.as_deref());
 
     // Validate profile exists
@@ -733,6 +1066,92 @@ fn cmd_install(profile: Option<String>, verbose: bool) -> Result<()> {
     } else {
         println!(
             "{} of {} package(s) installed ({} failed)",
+            success_count,
+            success_count + fail_count,
+            fail_count
+        );
+    }
+
+    Ok(())
+}
+
+fn cmd_install_common(verbose: bool, ctx: &CliContext) -> Result<()> {
+    use crate::utils::package_installer::PackageInstaller;
+    use std::sync::mpsc;
+    use std::thread;
+
+    let packages = PackageService::get_common_packages(&ctx.config.repo_path)?;
+
+    if packages.is_empty() {
+        println!("No common packages configured.");
+        return Ok(());
+    }
+
+    let missing: Vec<_> = packages
+        .iter()
+        .filter(|p| {
+            let result = PackageService::check_package(p);
+            matches!(result.status, PackageCheckStatus::NotInstalled)
+        })
+        .collect();
+
+    if missing.is_empty() {
+        print_success("All common packages are already installed");
+        return Ok(());
+    }
+
+    println!(
+        "Installing {} missing common package(s)...\n",
+        missing.len()
+    );
+
+    let mut success_count = 0;
+    let mut fail_count = 0;
+
+    for package in missing {
+        let manager_str = format!("{:?}", package.manager).to_lowercase();
+        if verbose {
+            println!("Installing {} ({})...", package.name, manager_str);
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let pkg_clone = package.clone();
+        thread::spawn(move || {
+            PackageInstaller::install(&pkg_clone, tx);
+        });
+
+        let mut install_success = false;
+        let mut error_msg = None;
+        for status in rx {
+            match status {
+                crate::ui::InstallationStatus::Output(line) => {
+                    if verbose {
+                        println!("{line}");
+                    }
+                }
+                crate::ui::InstallationStatus::Complete { success, error } => {
+                    install_success = success;
+                    error_msg = error;
+                }
+            }
+        }
+
+        if install_success {
+            success_count += 1;
+            println!("  \u{2713} {} ({})", package.name, manager_str);
+        } else {
+            fail_count += 1;
+            let err = error_msg.unwrap_or_else(|| "Unknown error".to_string());
+            println!("  \u{2717} {} ({}) - {}", package.name, manager_str, err);
+        }
+    }
+
+    println!();
+    if fail_count == 0 {
+        print_success(&format!("{success_count} common package(s) installed"));
+    } else {
+        println!(
+            "{} of {} common package(s) installed ({} failed)",
             success_count,
             success_count + fail_count,
             fail_count

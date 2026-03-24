@@ -55,6 +55,8 @@ pub enum Action {
     Edit,
     /// Create new item
     Create,
+    /// Create new item in the common (shared) section
+    CreateCommon,
     /// Search / filter
     Search,
     /// Refresh current view
@@ -126,6 +128,7 @@ impl Action {
             Action::Delete => "Delete",
             Action::Edit => "Edit",
             Action::Create => "Create new",
+            Action::CreateCommon => "Create in common (shared)",
             Action::Search => "Search",
             Action::Move => "Move",
             Action::Refresh => "Refresh",
@@ -172,6 +175,7 @@ impl Action {
             Action::Delete
             | Action::Edit
             | Action::Create
+            | Action::CreateCommon
             | Action::Search
             | Action::Refresh
             | Action::Move

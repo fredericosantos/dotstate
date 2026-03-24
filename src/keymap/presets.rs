@@ -66,6 +66,7 @@ fn standard_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("d", Action::Delete),
         KeyBinding::new("e", Action::Edit),
         KeyBinding::new("c", Action::Create),
+        KeyBinding::new("shift+c", Action::CreateCommon),
         KeyBinding::new("/", Action::Search),
         KeyBinding::new("r", Action::Refresh),
         KeyBinding::new("s", Action::CheckStatus),
@@ -124,6 +125,7 @@ fn vim_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("d", Action::Delete),
         KeyBinding::new("e", Action::Edit),
         KeyBinding::new("o", Action::Create), // 'o' for open/new in vim style
+        KeyBinding::new("shift+o", Action::CreateCommon),
         KeyBinding::new("/", Action::Search),
         KeyBinding::new("r", Action::Refresh),
         KeyBinding::new("s", Action::CheckStatus),
@@ -186,6 +188,7 @@ fn emacs_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("d", Action::Delete), // Use 'd' since Ctrl+D is DeleteChar in Emacs
         KeyBinding::new("ctrl+e", Action::Edit),
         KeyBinding::new("ctrl+o", Action::Create),
+        KeyBinding::new("ctrl+shift+o", Action::CreateCommon),
         KeyBinding::new("/", Action::Search), // Use / for search (Ctrl+S is used for Save)
         KeyBinding::new("ctrl+r", Action::Refresh),
         KeyBinding::new("ctrl+r", Action::Refresh),
