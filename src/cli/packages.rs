@@ -13,6 +13,7 @@ use crate::cli::common::{
     prompt_select_with_suffix, prompt_string, prompt_string_optional, CliContext,
 };
 use crate::services::{PackageCheckStatus, PackageCreationParams, PackageService};
+use crate::utils::profile_manifest::Package;
 use anyhow::Result;
 use clap::Subcommand;
 
@@ -241,17 +242,22 @@ fn cmd_help(command: Option<String>) -> Result<()> {
 }
 
 fn cmd_list(profile: Option<String>, verbose: bool, common: bool) -> Result<()> {
-    use crate::utils::package_cache::PackageCache;
-
     let ctx = CliContext::load()?;
 
     if common {
-        return cmd_list_common(verbose, &ctx);
+        let packages = PackageService::get_common_packages(&ctx.config.repo_path)?;
+        if packages.is_empty() {
+            println!("No common packages configured.");
+            println!("Use 'dotstate packages add --common' to add shared packages.");
+            return Ok(());
+        }
+        println!("Common packages (shared across all profiles):\n");
+        print_package_list(&packages, verbose, true, "common");
+        return Ok(());
     }
 
     let profile_name = ctx.resolve_profile(profile.as_deref());
 
-    // Validate profile exists
     if !ctx.profile_exists(&profile_name) {
         print_error(&format!("Profile '{profile_name}' not found"));
         std::process::exit(1);
@@ -260,9 +266,6 @@ fn cmd_list(profile: Option<String>, verbose: bool, common: bool) -> Result<()> 
     let is_active = ctx.is_active_profile(&profile_name);
     let packages = PackageService::get_packages(&ctx.config.repo_path, &profile_name)?;
 
-    // Initialize cache for updating status
-    let mut cache = PackageCache::new().unwrap_or_default();
-
     if packages.is_empty() {
         println!("No packages configured for profile '{profile_name}'");
         println!("Use 'dotstate packages add' to add packages.");
@@ -270,17 +273,28 @@ fn cmd_list(profile: Option<String>, verbose: bool, common: bool) -> Result<()> 
     }
 
     println!("Packages for profile '{profile_name}':\n");
+    print_package_list(&packages, verbose, is_active, &profile_name);
 
+    Ok(())
+}
+
+/// Shared logic for listing packages with optional status checking.
+///
+/// When `check_status` is true, each package's installation status is checked,
+/// cached under `cache_scope`, and displayed. Otherwise only name/manager are shown.
+fn print_package_list(packages: &[Package], verbose: bool, check_status: bool, cache_scope: &str) {
+    use crate::utils::package_cache::PackageCache;
+
+    let mut cache = PackageCache::new().unwrap_or_default();
     let mut installed_count = 0;
     let mut missing_count = 0;
 
-    for package in &packages {
+    for package in packages {
         let manager_str = format!("{:?}", package.manager).to_lowercase();
 
-        if is_active {
-            // Check installation status for active profile
+        let status_str = if check_status {
             let check_result = PackageService::check_package(package);
-            let (installed, status_str) = match check_result.status {
+            let (installed, status) = match check_result.status {
                 PackageCheckStatus::Installed => {
                     installed_count += 1;
                     (Some(true), "\u{2713} installed".to_string())
@@ -293,113 +307,15 @@ fn cmd_list(profile: Option<String>, verbose: bool, common: bool) -> Result<()> 
                 PackageCheckStatus::Unknown => (None, "? unknown".to_string()),
             };
 
-            // Update cache with check result
             if let Some(is_installed) = installed {
-                let _ = cache.update_status(
-                    &profile_name,
-                    &package.name,
-                    is_installed,
-                    None, // check_command not exposed by PackageService
-                    None, // output not exposed by PackageService
-                );
+                let _ = cache.update_status(cache_scope, &package.name, is_installed, None, None);
             }
 
-            if verbose {
-                println!("  {}", package.name);
-                println!("    Manager: {manager_str}");
-                if let Some(ref pkg_name) = package.package_name {
-                    println!("    Package: {pkg_name}");
-                }
-                println!("    Binary: {}", package.binary_name);
-                if let Some(ref desc) = package.description {
-                    println!("    Description: {desc}");
-                }
-                if let Some(ref cmd) = package.install_command {
-                    println!("    Install: {cmd}");
-                }
-                if let Some(ref check) = package.existence_check {
-                    println!("    Check: {check}");
-                }
-                println!("    Status: {status_str}");
-                println!();
-            } else {
-                println!("  {:<12} {:<8} {}", package.name, manager_str, status_str);
-            }
+            Some(status)
         } else {
-            // Non-active profile - no status checks
-            if verbose {
-                println!("  {}", package.name);
-                println!("    Manager: {manager_str}");
-                if let Some(ref pkg_name) = package.package_name {
-                    println!("    Package: {pkg_name}");
-                }
-                println!("    Binary: {}", package.binary_name);
-                if let Some(ref desc) = package.description {
-                    println!("    Description: {desc}");
-                }
-                if let Some(ref cmd) = package.install_command {
-                    println!("    Install: {cmd}");
-                }
-                if let Some(ref check) = package.existence_check {
-                    println!("    Check: {check}");
-                }
-                println!();
-            } else {
-                println!("  {:<12} {}", package.name, manager_str);
-            }
-        }
-    }
-
-    // Summary
-    if is_active {
-        println!(
-            "\n{} packages ({} installed, {} missing)",
-            packages.len(),
-            installed_count,
-            missing_count
-        );
-    } else {
-        println!("\n{} packages", packages.len());
-    }
-
-    Ok(())
-}
-
-fn cmd_list_common(verbose: bool, ctx: &CliContext) -> Result<()> {
-    use crate::utils::package_cache::PackageCache;
-
-    let packages = PackageService::get_common_packages(&ctx.config.repo_path)?;
-    let mut cache = PackageCache::new().unwrap_or_default();
-
-    if packages.is_empty() {
-        println!("No common packages configured.");
-        println!("Use 'dotstate packages add --common' to add shared packages.");
-        return Ok(());
-    }
-
-    println!("Common packages (shared across all profiles):\n");
-
-    let mut installed_count = 0;
-    let mut missing_count = 0;
-
-    for package in &packages {
-        let manager_str = format!("{:?}", package.manager).to_lowercase();
-        let result = PackageService::check_package(package);
-        let (installed, status_str) = match result.status {
-            PackageCheckStatus::Installed => {
-                installed_count += 1;
-                (Some(true), "\u{2713} installed".to_string())
-            }
-            PackageCheckStatus::NotInstalled => {
-                missing_count += 1;
-                (Some(false), "\u{2717} not installed".to_string())
-            }
-            PackageCheckStatus::Error(ref e) => (None, format!("? {e}")),
-            PackageCheckStatus::Unknown => (None, "? unknown".to_string()),
+            None
         };
-        if let Some(is_installed) = installed {
-            let _ = cache.update_status("common", &package.name, is_installed, None, None);
-        }
+
         if verbose {
             println!("  {}", package.name);
             println!("    Manager: {manager_str}");
@@ -410,20 +326,33 @@ fn cmd_list_common(verbose: bool, ctx: &CliContext) -> Result<()> {
             if let Some(ref desc) = package.description {
                 println!("    Description: {desc}");
             }
-            println!("    Status: {status_str}");
+            if let Some(ref cmd) = package.install_command {
+                println!("    Install: {cmd}");
+            }
+            if let Some(ref check) = package.existence_check {
+                println!("    Check: {check}");
+            }
+            if let Some(ref status) = status_str {
+                println!("    Status: {status}");
+            }
             println!();
+        } else if let Some(ref status) = status_str {
+            println!("  {:<12} {:<8} {}", package.name, manager_str, status);
         } else {
-            println!("  {:<12} {:<8} {}", package.name, manager_str, status_str);
+            println!("  {:<12} {}", package.name, manager_str);
         }
     }
 
-    println!(
-        "\n{} common packages ({} installed, {} missing)",
-        packages.len(),
-        installed_count,
-        missing_count
-    );
-    Ok(())
+    if check_status {
+        println!(
+            "\n{} packages ({} installed, {} missing)",
+            packages.len(),
+            installed_count,
+            missing_count
+        );
+    } else {
+        println!("\n{} packages", packages.len());
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -577,6 +506,7 @@ fn cmd_add(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_add_common(
     name: Option<String>,
     manager: Option<String>,
@@ -790,11 +720,9 @@ fn cmd_remove_common(yes: bool, name: Option<String>, ctx: &CliContext) -> Resul
         (selected, packages[selected].name.clone())
     };
 
-    if !yes {
-        if !prompt_confirm(&format!("Remove common package '{package_name}'?"))? {
-            println!("Cancelled.");
-            return Ok(());
-        }
+    if !yes && !prompt_confirm(&format!("Remove common package '{package_name}'?"))? {
+        println!("Cancelled.");
+        return Ok(());
     }
 
     PackageService::delete_common_package(&ctx.config.repo_path, index)?;
@@ -803,23 +731,26 @@ fn cmd_remove_common(yes: bool, name: Option<String>, ctx: &CliContext) -> Resul
 }
 
 fn cmd_check(profile: Option<String>, common: bool) -> Result<()> {
-    use crate::utils::package_cache::PackageCache;
-
     let ctx = CliContext::load()?;
 
     if common {
-        return cmd_check_common(&ctx);
+        let packages = PackageService::get_common_packages(&ctx.config.repo_path)?;
+        if packages.is_empty() {
+            println!("No common packages configured.");
+            return Ok(());
+        }
+        println!("Checking common packages (shared across all profiles)...\n");
+        check_and_print_packages(&packages, "common");
+        return Ok(());
     }
 
     let profile_name = ctx.resolve_profile(profile.as_deref());
 
-    // Validate profile exists
     if !ctx.profile_exists(&profile_name) {
         print_error(&format!("Profile '{profile_name}' not found"));
         std::process::exit(1);
     }
 
-    // Check can only work for active profile
     if !ctx.is_active_profile(&profile_name) {
         print_warning(&format!(
             "Cannot check installation status for non-active profile '{profile_name}'"
@@ -835,16 +766,22 @@ fn cmd_check(profile: Option<String>, common: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Initialize cache for updating status
-    let mut cache = PackageCache::new().unwrap_or_default();
-
     println!("Checking packages for profile '{profile_name}'...\n");
+    check_and_print_packages(&packages, &profile_name);
 
+    Ok(())
+}
+
+/// Shared logic for checking package installation status and printing results.
+fn check_and_print_packages(packages: &[Package], cache_scope: &str) {
+    use crate::utils::package_cache::PackageCache;
+
+    let mut cache = PackageCache::new().unwrap_or_default();
     let mut installed = 0;
     let mut not_installed = 0;
     let mut errors = 0;
 
-    for package in &packages {
+    for package in packages {
         let manager_str = format!("{:?}", package.manager).to_lowercase();
         let result = PackageService::check_package(package);
 
@@ -859,7 +796,6 @@ fn cmd_check(profile: Option<String>, common: bool) -> Result<()> {
             }
             PackageCheckStatus::Error(ref e) => {
                 errors += 1;
-                // Print inline for errors
                 println!("  {:<12} {:<8} ? {}", package.name, manager_str, e);
                 continue;
             }
@@ -869,15 +805,8 @@ fn cmd_check(profile: Option<String>, common: bool) -> Result<()> {
             }
         };
 
-        // Update cache with check result
         if let Some(installed_status) = is_installed {
-            let _ = cache.update_status(
-                &profile_name,
-                &package.name,
-                installed_status,
-                None, // check_command not exposed by PackageService
-                None, // output not exposed by PackageService
-            );
+            let _ = cache.update_status(cache_scope, &package.name, installed_status, None, None);
         }
 
         println!("  {:<12} {:<8} {}", package.name, manager_str, status_str);
@@ -898,88 +827,27 @@ fn cmd_check(profile: Option<String>, common: bool) -> Result<()> {
     if errors > 0 {
         println!("({errors} check errors)");
     }
-
-    Ok(())
-}
-
-fn cmd_check_common(ctx: &CliContext) -> Result<()> {
-    use crate::utils::package_cache::PackageCache;
-
-    let packages = PackageService::get_common_packages(&ctx.config.repo_path)?;
-
-    if packages.is_empty() {
-        println!("No common packages configured.");
-        return Ok(());
-    }
-
-    let mut cache = PackageCache::new().unwrap_or_default();
-    println!("Checking common packages (shared across all profiles)...\n");
-
-    let mut installed = 0;
-    let mut not_installed = 0;
-    let mut errors = 0;
-
-    for package in &packages {
-        let manager_str = format!("{:?}", package.manager).to_lowercase();
-        let result = PackageService::check_package(package);
-        let (is_installed, status_str) = match result.status {
-            PackageCheckStatus::Installed => {
-                installed += 1;
-                (Some(true), "\u{2713} installed")
-            }
-            PackageCheckStatus::NotInstalled => {
-                not_installed += 1;
-                (Some(false), "\u{2717} not installed")
-            }
-            PackageCheckStatus::Error(ref e) => {
-                errors += 1;
-                println!("  {:<12} {:<8} ? {}", package.name, manager_str, e);
-                continue;
-            }
-            PackageCheckStatus::Unknown => {
-                errors += 1;
-                (None, "? unknown")
-            }
-        };
-        if let Some(v) = is_installed {
-            let _ = cache.update_status("common", &package.name, v, None, None);
-        }
-        println!("  {:<12} {:<8} {}", package.name, manager_str, status_str);
-    }
-
-    println!();
-    println!(
-        "{} of {} common packages installed ({} missing)",
-        installed,
-        packages.len(),
-        not_installed
-    );
-    if errors > 0 {
-        println!("({errors} check errors)");
-    }
-    Ok(())
 }
 
 fn cmd_install(profile: Option<String>, verbose: bool, common: bool) -> Result<()> {
-    use crate::utils::package_installer::PackageInstaller;
-    use std::sync::mpsc;
-    use std::thread;
-
     let ctx = CliContext::load()?;
 
     if common {
-        return cmd_install_common(verbose, &ctx);
+        let packages = PackageService::get_common_packages(&ctx.config.repo_path)?;
+        if packages.is_empty() {
+            println!("No common packages configured.");
+            return Ok(());
+        }
+        return install_missing_packages(&packages, verbose);
     }
 
     let profile_name = ctx.resolve_profile(profile.as_deref());
 
-    // Validate profile exists
     if !ctx.profile_exists(&profile_name) {
         print_error(&format!("Profile '{profile_name}' not found"));
         std::process::exit(1);
     }
 
-    // Install can only work for active profile
     if !ctx.is_active_profile(&profile_name) {
         print_warning(&format!(
             "Cannot install packages for non-active profile '{profile_name}'"
@@ -995,7 +863,15 @@ fn cmd_install(profile: Option<String>, verbose: bool, common: bool) -> Result<(
         return Ok(());
     }
 
-    // Find missing packages
+    install_missing_packages(&packages, verbose)
+}
+
+/// Shared logic for finding and installing missing packages.
+fn install_missing_packages(packages: &[Package], verbose: bool) -> Result<()> {
+    use crate::utils::package_installer::PackageInstaller;
+    use std::sync::mpsc;
+    use std::thread;
+
     let missing: Vec<_> = packages
         .iter()
         .filter(|p| {
@@ -1009,11 +885,7 @@ fn cmd_install(profile: Option<String>, verbose: bool, common: bool) -> Result<(
         return Ok(());
     }
 
-    println!(
-        "Installing {} missing package(s) for profile '{}'...\n",
-        missing.len(),
-        profile_name
-    );
+    println!("Installing {} missing package(s)...\n", missing.len());
 
     let mut success_count = 0;
     let mut fail_count = 0;
@@ -1025,14 +897,12 @@ fn cmd_install(profile: Option<String>, verbose: bool, common: bool) -> Result<(
             println!("Installing {} ({})...", package.name, manager_str);
         }
 
-        // Spawn install in background thread so we can stream output in real-time
         let (tx, rx) = mpsc::channel();
         let pkg_clone = package.clone();
         thread::spawn(move || {
             PackageInstaller::install(&pkg_clone, tx);
         });
 
-        // Stream output as it arrives
         let mut install_success = false;
         let mut error_msg = None;
 
@@ -1066,92 +936,6 @@ fn cmd_install(profile: Option<String>, verbose: bool, common: bool) -> Result<(
     } else {
         println!(
             "{} of {} package(s) installed ({} failed)",
-            success_count,
-            success_count + fail_count,
-            fail_count
-        );
-    }
-
-    Ok(())
-}
-
-fn cmd_install_common(verbose: bool, ctx: &CliContext) -> Result<()> {
-    use crate::utils::package_installer::PackageInstaller;
-    use std::sync::mpsc;
-    use std::thread;
-
-    let packages = PackageService::get_common_packages(&ctx.config.repo_path)?;
-
-    if packages.is_empty() {
-        println!("No common packages configured.");
-        return Ok(());
-    }
-
-    let missing: Vec<_> = packages
-        .iter()
-        .filter(|p| {
-            let result = PackageService::check_package(p);
-            matches!(result.status, PackageCheckStatus::NotInstalled)
-        })
-        .collect();
-
-    if missing.is_empty() {
-        print_success("All common packages are already installed");
-        return Ok(());
-    }
-
-    println!(
-        "Installing {} missing common package(s)...\n",
-        missing.len()
-    );
-
-    let mut success_count = 0;
-    let mut fail_count = 0;
-
-    for package in missing {
-        let manager_str = format!("{:?}", package.manager).to_lowercase();
-        if verbose {
-            println!("Installing {} ({})...", package.name, manager_str);
-        }
-
-        let (tx, rx) = mpsc::channel();
-        let pkg_clone = package.clone();
-        thread::spawn(move || {
-            PackageInstaller::install(&pkg_clone, tx);
-        });
-
-        let mut install_success = false;
-        let mut error_msg = None;
-        for status in rx {
-            match status {
-                crate::ui::InstallationStatus::Output(line) => {
-                    if verbose {
-                        println!("{line}");
-                    }
-                }
-                crate::ui::InstallationStatus::Complete { success, error } => {
-                    install_success = success;
-                    error_msg = error;
-                }
-            }
-        }
-
-        if install_success {
-            success_count += 1;
-            println!("  \u{2713} {} ({})", package.name, manager_str);
-        } else {
-            fail_count += 1;
-            let err = error_msg.unwrap_or_else(|| "Unknown error".to_string());
-            println!("  \u{2717} {} ({}) - {}", package.name, manager_str, err);
-        }
-    }
-
-    println!();
-    if fail_count == 0 {
-        print_success(&format!("{success_count} common package(s) installed"));
-    } else {
-        println!(
-            "{} of {} common package(s) installed ({} failed)",
             success_count,
             success_count + fail_count,
             fail_count

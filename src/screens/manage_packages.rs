@@ -1067,11 +1067,11 @@ impl ManagePackagesScreen {
                 if state.popup_type == PackagePopupType::None && !state.is_checking {
                     match selected_item {
                         SelectedPackageItem::Common(i) => {
-                            self.start_edit_common_package(i)?;
+                            self.start_edit_package(i, true)?;
                             return Ok(ScreenAction::Refresh);
                         }
                         SelectedPackageItem::Profile(i) => {
-                            self.start_edit_package(i)?;
+                            self.start_edit_package(i, false)?;
                             return Ok(ScreenAction::Refresh);
                         }
                         _ => {}
@@ -1162,10 +1162,15 @@ impl ManagePackagesScreen {
         Ok(())
     }
 
-    fn start_edit_common_package(&mut self, index: usize) -> Result<()> {
+    fn start_edit_package(&mut self, index: usize, is_common: bool) -> Result<()> {
         let state = &mut self.state;
-        if let Some(pkg) = state.common_packages.get(index).cloned() {
-            state.is_adding_common = true;
+        state.is_adding_common = is_common;
+        let pkg = if is_common {
+            state.common_packages.get(index).cloned()
+        } else {
+            state.packages.get(index).cloned()
+        };
+        if let Some(pkg) = pkg {
             state.popup_type = PackagePopupType::Edit;
             state.add_editing_index = Some(index);
             state.add_validation_error = None;
@@ -1200,50 +1205,6 @@ impl ManagePackagesScreen {
             state
                 .manager_list_state
                 .select(Some(state.add_manager_selected));
-            state.add_focused_field = AddPackageField::Name;
-        }
-        Ok(())
-    }
-
-    fn start_edit_package(&mut self, index: usize) -> Result<()> {
-        let state = &mut self.state;
-        state.is_adding_common = false;
-        if let Some(pkg) = state.packages.get(index) {
-            state.popup_type = PackagePopupType::Edit;
-            state.add_editing_index = Some(index);
-            state.add_validation_error = None;
-            state.add_name_input = crate::utils::TextInput::with_text(&pkg.name);
-            state.add_description_input =
-                crate::utils::TextInput::with_text(pkg.description.clone().unwrap_or_default());
-            state.add_package_name_input =
-                crate::utils::TextInput::with_text(pkg.package_name.clone().unwrap_or_default());
-            state.add_binary_name_input = crate::utils::TextInput::with_text(&pkg.binary_name);
-            state.add_install_command_input =
-                crate::utils::TextInput::with_text(pkg.install_command.clone().unwrap_or_default());
-            state.add_existence_check_input =
-                crate::utils::TextInput::with_text(pkg.existence_check.clone().unwrap_or_default());
-            state.add_manager_check_input =
-                crate::utils::TextInput::with_text(pkg.manager_check.clone().unwrap_or_default());
-
-            state.available_managers = PackageManagerImpl::get_available_managers();
-            state.add_manager = Some(pkg.manager.clone());
-            state.add_is_custom = matches!(
-                pkg.manager,
-                crate::utils::profile_manifest::PackageManager::Custom
-            );
-            if let Some(pos) = state
-                .available_managers
-                .iter()
-                .position(|m| *m == pkg.manager)
-            {
-                state.add_manager_selected = pos;
-            } else {
-                state.add_manager_selected = 0;
-            }
-            state
-                .manager_list_state
-                .select(Some(state.add_manager_selected));
-
             state.add_focused_field = AddPackageField::Name;
         }
         Ok(())
@@ -1711,7 +1672,7 @@ impl ManagePackagesScreen {
                                 }
                                 self.state.newly_added_index = Some(idx);
                             }
-                        };
+                        }
 
                         self.reset_state();
                         // Trigger check for the new/updated package
