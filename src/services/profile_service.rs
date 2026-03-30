@@ -98,6 +98,7 @@ impl ProfileService {
     /// * `repo_path` - Path to the repository.
     /// * `name` - Name for the new profile.
     /// * `description` - Optional description.
+    /// * `inherits` - Optional parent profile to inherit from.
     /// * `copy_from` - Optional index of profile to copy files from.
     ///
     /// # Returns
@@ -107,8 +108,8 @@ impl ProfileService {
         repo_path: &Path,
         name: &str,
         description: Option<String>,
-        copy_from: Option<usize>,
         inherits: Option<String>,
+        copy_from: Option<usize>,
     ) -> Result<String> {
         // Validate and sanitize profile name
         let sanitized_name = sanitize_profile_name(name);
@@ -233,7 +234,7 @@ impl ProfileService {
             });
         }
 
-        // Resolve the full file list for the target (inheritance + common)
+        // Resolve file list for the target profile
         let resolved_files = manifest.resolve_files(target_profile_name)?;
         let resolved_packages = manifest.resolve_packages(target_profile_name)?;
 
@@ -258,7 +259,33 @@ impl ProfileService {
                     "Failed to activate profile '{}': {}",
                     target_profile_name, e
                 );
-                return Err(anyhow::anyhow!("Failed to activate new profile: {e}"));
+                // Attempt rollback: resolve old profile files lazily (only needed on failure)
+                warn!("Attempting rollback to profile '{}'", old_profile_name);
+                let rollback_result =
+                    manifest
+                        .resolve_files(old_profile_name)
+                        .and_then(|old_files| {
+                            symlink_mgr.activate_resolved(old_profile_name, &old_files)
+                        });
+                if let Err(rollback_err) = rollback_result {
+                    error!(
+                        "Rollback also failed for profile '{}': {}",
+                        old_profile_name, rollback_err
+                    );
+                    return Err(anyhow::anyhow!(
+                        "Failed to activate new profile '{target_profile_name}': {e}. \
+                         Rollback to '{old_profile_name}' also failed: {rollback_err}. \
+                         Run 'dotstate activate' to restore symlinks."
+                    ));
+                }
+                warn!(
+                    "Rollback succeeded — old profile '{}' restored",
+                    old_profile_name
+                );
+                return Err(anyhow::anyhow!(
+                    "Failed to activate profile '{target_profile_name}': {e}. \
+                     Rolled back to '{old_profile_name}'."
+                ));
             }
         };
 

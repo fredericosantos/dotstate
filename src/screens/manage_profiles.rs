@@ -195,8 +195,8 @@ impl ManageProfilesScreen {
             &config.repo_path,
             name,
             description,
-            copy_from,
             inherits.clone(),
+            copy_from,
         ) {
             Ok(sanitized_name) => {
                 info!("Profile '{}' created successfully", sanitized_name);
@@ -600,25 +600,36 @@ impl ManageProfilesScreen {
             // Use cached resolved files (populated in refresh_profiles)
             let resolved = self.state.resolved_files.get(&profile.name);
 
-            let own_files_count = profile.synced_files.len();
-            let total_files_count = resolved.map_or(own_files_count, Vec::len);
-            let inherited_count = total_files_count.saturating_sub(own_files_count);
+            let total_files_count = resolved.map_or(profile.synced_files.len(), Vec::len);
 
             let files_text = if total_files_count == 0 {
                 "No files synced".to_string()
-            } else if inherited_count > 0 {
-                let common_count = resolved.map_or(0, |r| {
-                    r.iter().filter(|f| f.source_profile == "common").count()
-                });
-                let from_parents = inherited_count.saturating_sub(common_count);
-                let mut parts = vec![format!("{own_files_count} own")];
-                if from_parents > 0 {
-                    parts.push(format!("{from_parents} inherited"));
+            } else if let Some(resolved) = resolved {
+                // Single pass to categorize files by source
+                let (mut own_count, mut common_count, mut inherited_count) =
+                    (0usize, 0usize, 0usize);
+                for f in resolved {
+                    if f.source_profile == profile.name {
+                        own_count += 1;
+                    } else if f.source_profile == "common" {
+                        common_count += 1;
+                    } else {
+                        inherited_count += 1;
+                    }
                 }
-                if common_count > 0 {
-                    parts.push(format!("{common_count} common"));
+
+                if inherited_count > 0 || common_count > 0 {
+                    let mut parts = vec![format!("{own_count} own")];
+                    if inherited_count > 0 {
+                        parts.push(format!("{inherited_count} inherited"));
+                    }
+                    if common_count > 0 {
+                        parts.push(format!("{common_count} common"));
+                    }
+                    format!("{total_files_count} files synced ({}):", parts.join(", "))
+                } else {
+                    format!("{total_files_count} files synced:")
                 }
-                format!("{total_files_count} files synced ({}):", parts.join(", "))
             } else {
                 format!("{total_files_count} files synced:")
             };
@@ -827,20 +838,35 @@ impl ManageProfilesScreen {
         // Inherits From option - show list of profiles to optionally inherit from
         {
             let is_focused = self.state.create_focused_field == CreateField::InheritsFrom;
-            let border_style = if is_focused {
+            let is_disabled = self.state.create_copy_from.is_some();
+            let border_style = if is_disabled {
+                crate::utils::disabled_border_style()
+            } else if is_focused {
                 focused_border_style()
             } else {
                 unfocused_border_style()
             };
 
-            if self.state.profiles.is_empty() {
-                let para = Paragraph::new("No profiles available to inherit from")
+            let title = if is_disabled {
+                " Inherits From (disabled — Copy From is set) "
+            } else {
+                " Inherits From — live link to parent profile "
+            };
+
+            if self.state.profiles.is_empty() || is_disabled {
+                let msg = if is_disabled {
+                    "Disabled. Clear Copy From to use inheritance."
+                } else {
+                    "No profiles available to inherit from"
+                };
+                let para = Paragraph::new(msg)
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
-                            .title(" Inherits From (optional) ")
+                            .title(title)
                             .border_style(border_style),
                     )
+                    .style(crate::utils::disabled_text_style())
                     .wrap(Wrap { trim: true });
                 frame.render_widget(para, chunks[3]);
             } else {
@@ -879,7 +905,7 @@ impl ManageProfilesScreen {
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
-                            .title(" Inherits From (optional) ")
+                            .title(title)
                             .border_type(theme().border_type(false))
                             .border_style(border_style),
                     )
@@ -899,20 +925,35 @@ impl ManageProfilesScreen {
 
         // Copy from option - show list of profiles to select from
         let is_focused = self.state.create_focused_field == CreateField::CopyFrom;
-        let border_style = if is_focused {
+        let is_disabled = self.state.create_inherits_from.is_some();
+        let border_style = if is_disabled {
+            crate::utils::disabled_border_style()
+        } else if is_focused {
             focused_border_style()
         } else {
             unfocused_border_style()
         };
 
-        if self.state.profiles.is_empty() {
-            let copy_para = Paragraph::new("No profiles available to copy from")
+        let copy_title = if is_disabled {
+            " Copy From (disabled — Inherits From is set) "
+        } else {
+            " Copy From — one-time file copy "
+        };
+
+        if self.state.profiles.is_empty() || is_disabled {
+            let msg = if is_disabled {
+                "Disabled. Clear Inherits From to copy files."
+            } else {
+                "No profiles available to copy from"
+            };
+            let copy_para = Paragraph::new(msg)
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title(" Copy From ")
+                        .title(copy_title)
                         .border_style(border_style),
                 )
+                .style(crate::utils::disabled_text_style())
                 .wrap(Wrap { trim: true });
             frame.render_widget(copy_para, chunks[4]);
         } else {
@@ -964,7 +1005,7 @@ impl ManageProfilesScreen {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title(" Copy From ")
+                        .title(copy_title)
                         .border_type(theme().border_type(false))
                         .border_style(border_style),
                 )
@@ -1299,25 +1340,45 @@ impl Screen for ManageProfilesScreen {
                                         return Ok(ScreenAction::Refresh);
                                     }
                                     Action::NextTab => {
+                                        let inherits_disabled =
+                                            self.state.create_copy_from.is_some();
+                                        let copy_disabled =
+                                            self.state.create_inherits_from.is_some();
                                         self.state.create_focused_field = match self
                                             .state
                                             .create_focused_field
                                         {
                                             CreateField::Name => CreateField::Description,
+                                            CreateField::Description if inherits_disabled => {
+                                                CreateField::CopyFrom
+                                            }
                                             CreateField::Description => CreateField::InheritsFrom,
+                                            CreateField::InheritsFrom if copy_disabled => {
+                                                CreateField::Name
+                                            }
                                             CreateField::InheritsFrom => CreateField::CopyFrom,
                                             CreateField::CopyFrom => CreateField::Name,
                                         };
                                         return Ok(ScreenAction::Refresh);
                                     }
                                     Action::PrevTab => {
+                                        let inherits_disabled =
+                                            self.state.create_copy_from.is_some();
+                                        let copy_disabled =
+                                            self.state.create_inherits_from.is_some();
                                         self.state.create_focused_field = match self
                                             .state
                                             .create_focused_field
                                         {
+                                            CreateField::Name if copy_disabled => {
+                                                CreateField::InheritsFrom
+                                            }
                                             CreateField::Name => CreateField::CopyFrom,
                                             CreateField::Description => CreateField::Name,
                                             CreateField::InheritsFrom => CreateField::Description,
+                                            CreateField::CopyFrom if inherits_disabled => {
+                                                CreateField::Description
+                                            }
                                             CreateField::CopyFrom => CreateField::InheritsFrom,
                                         };
                                         return Ok(ScreenAction::Refresh);
@@ -1393,6 +1454,10 @@ impl Screen for ManageProfilesScreen {
                                             } else {
                                                 Some(new_val - 1)
                                             };
+                                            // Clear copy_from when inherits is set
+                                            if self.state.create_inherits_from.is_some() {
+                                                self.state.create_copy_from = None;
+                                            }
                                             return Ok(ScreenAction::Refresh);
                                         }
                                     } else if self.state.create_focused_field
@@ -1407,6 +1472,10 @@ impl Screen for ManageProfilesScreen {
                                             } else {
                                                 Some(new_val - 1)
                                             };
+                                            // Clear inherits when copy_from is set
+                                            if self.state.create_copy_from.is_some() {
+                                                self.state.create_inherits_from = None;
+                                            }
                                             return Ok(ScreenAction::Refresh);
                                         }
                                     }
@@ -1421,6 +1490,8 @@ impl Screen for ManageProfilesScreen {
                                         if current < total - 1 {
                                             let new_val = current + 1;
                                             self.state.create_inherits_from = Some(new_val - 1);
+                                            // Clear copy_from when inherits is set
+                                            self.state.create_copy_from = None;
                                             return Ok(ScreenAction::Refresh);
                                         }
                                     } else if self.state.create_focused_field
@@ -1433,6 +1504,8 @@ impl Screen for ManageProfilesScreen {
                                         if current < total - 1 {
                                             let new_val = current + 1;
                                             self.state.create_copy_from = Some(new_val - 1);
+                                            // Clear inherits when copy_from is set
+                                            self.state.create_inherits_from = None;
                                             return Ok(ScreenAction::Refresh);
                                         }
                                     }

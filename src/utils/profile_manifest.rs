@@ -21,6 +21,19 @@ pub struct ResolvedFile {
     pub source_profile: String,
 }
 
+impl ResolvedFile {
+    /// Convert a plain file list into resolved entries, all from the same profile.
+    pub fn from_files(profile_name: &str, files: &[String]) -> Vec<Self> {
+        files
+            .iter()
+            .map(|f| Self {
+                relative_path: f.clone(),
+                source_profile: profile_name.to_string(),
+            })
+            .collect()
+    }
+}
+
 /// Package manager types
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]

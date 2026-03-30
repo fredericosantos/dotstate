@@ -22,11 +22,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Manage Profiles UI**: "Inherits From" and "Copy From" are now mutually exclusive — selecting one disables the other with a clear explanation. Both fields show descriptive titles ("live link to parent profile" vs "one-time file copy") and Tab skips disabled fields.
 - **Docs**: Updated `CONTRIBUTING.md` project structure to match current modular layout (`src/cli/`, `src/screens/`, services layer, and `lib.rs`)
 - **Developer Guide**: Clarified symlink rule in `CLAUDE.md` and `.claude/skills/dotstate-dev/SKILL.md` to distinguish tracked home↔repo symlinks from internal content-symlink preservation during recursive copy
 
 ### Fixed
 
+- **Profile Inheritance**: Fixed profile switch atomicity — if activating the new profile fails, the old profile's symlinks are now restored automatically instead of leaving the user with no symlinks
+- **Profile Inheritance**: Fixed file count display in profile details — counts are now computed from resolved file sources instead of subtraction, preventing incorrect numbers when files are overridden
+- **Profile Inheritance**: Removed redundant `symlink_metadata()` call in `ensure_resolved_symlinks`
+- **Profile Inheritance**: Deduplicated `activate_profile`/`ensure_profile_symlinks` to delegate to their resolved-file counterparts, eliminating parallel code paths
+- **Profile Inheritance**: Fixed `create_profile` parameter order to match action enum conventions (`description, inherits, copy_from`)
 - **README**: Fixed website install command typo (removed trailing quote from `curl ... | bash`)
 - **Navigation**: Implemented `NavigateWithMessage` handling so message payloads are shown in a dialog instead of being dropped
 - **Backups**: Switched backup session timestamp format to filesystem-safe naming (`YYYY-MM-DDTHH-MM-SS`)
