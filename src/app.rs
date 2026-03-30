@@ -1273,6 +1273,7 @@ impl App {
             ScreenAction::CreateProfile {
                 name,
                 description,
+                inherits,
                 copy_from,
             } => {
                 use crate::screens::manage_profiles::ProfileAction;
@@ -1280,6 +1281,7 @@ impl App {
                     ProfileAction::CreateProfile {
                         name,
                         description,
+                        inherits,
                         copy_from,
                     },
                     &mut self.config,
@@ -1428,7 +1430,7 @@ impl App {
 
         // Create the profile first if requested
         if create_first {
-            match ProfileService::create_profile(&self.config.repo_path, name, None, None) {
+            match ProfileService::create_profile(&self.config.repo_path, name, None, None, None) {
                 Ok(sanitized_name) => {
                     info!("Created profile '{}' during setup", sanitized_name);
                     // Use the sanitized name for activation
