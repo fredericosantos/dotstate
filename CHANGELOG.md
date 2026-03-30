@@ -7,30 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [0.3.2] - 2026-03-30
+
 ### Added
 
-- **Profile Inheritance**: Profiles can now inherit files and packages from a parent profile via single inheritance with child-wins override semantics
-  - New `inherits` field in profile manifest (`.dotstate-profiles.toml`) — each profile can specify at most one parent
-  - Multi-level chaining supported (e.g., p3 → p2 → p1); cycles are detected and rejected
-  - File resolution: child files override parent files, and profile files override common files with the same path
-  - Package inheritance: packages merged across the chain, child packages override parent packages with matching name + manager
-  - Manifest version bumped to 2 with automatic migration from v1 (no-op — `inherits` defaults to `None`)
-  - **Manage Profiles UI**: Create popup includes "Inherits From" field; profile details show inheritance info and resolved file counts with source annotations
-  - **CLI**: `list` command groups files by source (common / inherited / own) and shows inheritance chain; `activate` uses resolved files
-  - Delete protection: profiles that other profiles inherit from cannot be deleted
-  - Rename propagation: renaming a profile updates `inherits` references in child profiles
+- **Profile Inheritance**: Profiles can now inherit from a parent profile with child-wins override semantics. Multi-level chaining (child → parent → grandparent), cycle detection, delete protection for inherited profiles, and rename propagation across the inheritance chain. Manifest auto-migrates from v1 to v2.
+- **Manage Profiles UI**: Create popup includes "Inherits From" field with live parent selection; profile details show resolved file counts with source annotations (own / inherited / common)
+- **CLI**: `list` command groups files by source and shows inheritance chain; `activate` resolves the full inheritance chain
 
 ### Changed
 
-- **Docs**: Updated `CONTRIBUTING.md` project structure to match current modular layout (`src/cli/`, `src/screens/`, services layer, and `lib.rs`)
-- **Developer Guide**: Clarified symlink rule in `CLAUDE.md` and `.claude/skills/dotstate-dev/SKILL.md` to distinguish tracked home↔repo symlinks from internal content-symlink preservation during recursive copy
+- **Manage Profiles UI**: "Inherits From" and "Copy From" are now mutually exclusive in the create popup — selecting one disables the other with descriptive labels ("live link to parent profile" vs "one-time file copy")
+- **Docs**: Updated README, website, and CONTRIBUTING.md with profile inheritance documentation
 
 ### Fixed
 
-- **README**: Fixed website install command typo (removed trailing quote from `curl ... | bash`)
-- **Navigation**: Implemented `NavigateWithMessage` handling so message payloads are shown in a dialog instead of being dropped
-- **Backups**: Switched backup session timestamp format to filesystem-safe naming (`YYYY-MM-DDTHH-MM-SS`)
-- **Tests**: Made backup/symlink tests sandbox-safe and deterministic by using test-local writable paths instead of real home-directory side effects
+- **Profile Switch**: Atomic profile switching with rollback — if activating the new profile fails, the old profile's symlinks are restored automatically
+- **Symlink Manager**: Deduplicated `activate_profile`/`ensure_profile_symlinks` into their resolved-file counterparts, eliminating parallel code paths
+- **Navigation**: `NavigateWithMessage` payloads are now shown in a dialog instead of being dropped
+- **Backups**: Switched backup session timestamps to filesystem-safe format (`YYYY-MM-DDTHH-MM-SS`)
+- **Tests**: Made backup/symlink tests sandbox-safe using test-local paths instead of real home directory
 
 ---
 

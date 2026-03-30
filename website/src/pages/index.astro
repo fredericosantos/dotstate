@@ -125,8 +125,8 @@ const sections = [
                             <strong>Tip:</strong> When you select a file, it's automatically copied to your repository and a symlink is created in its place. This means your files are safely backed up and version controlled.
                         </Tip>
 
-                        <h3>Profiles & Common Files</h3>
-                        <p>Organize your dotfiles with <strong>profiles</strong> for different machines or contexts. Files you choose to mark as <strong>common</strong> are shared across all profiles — the rest stay profile-specific. See <a href="#examples" class="section-link" data-section="examples">Examples</a> for workflows.</p>
+                        <h3>Profiles, Inheritance & Common Files</h3>
+                        <p>Organize your dotfiles with <strong>profiles</strong> for different machines or contexts. Profiles can <strong>inherit</strong> from a parent — child files override parent files, so you only define what's different. Files you mark as <strong>common</strong> are shared across all profiles. See <a href="#examples" class="section-link" data-section="examples">Examples</a> for workflows.</p>
                         <CodeBlock code={"Common Files (shared)     Profile-specific\n─────────────────────    ─────────────────\n .gitconfig               Personal/\n .tmux.conf      ───►      .zshrc\n .vimrc                    .ssh/config\n                          Work/\n                           .zshrc\n                           work-scripts/"} />
                     </div>
 
@@ -158,6 +158,9 @@ const sections = [
                             </FeatureCard>
                             <FeatureCard icon="[*]" title="Common Files Support">
                                 Share dotfiles across all profiles automatically.
+                            </FeatureCard>
+                            <FeatureCard icon="[^]" title="Profile Inheritance">
+                                Extend a parent profile and override only what differs. Changes to the parent flow to all children automatically.
                             </FeatureCard>
                         </FeatureGrid>
 
@@ -285,7 +288,7 @@ const sections = [
 
                         <CommandCard
                             command="dotstate list"
-                            description="List all synced files with their symlink and storage locations."
+                            description="List all synced files grouped by source (own, inherited, common) with symlink and storage locations."
                             options="<code>-v, --verbose</code> Show detailed information"
                         />
 
@@ -409,13 +412,15 @@ const sections = [
                             <p>Profiles let you organize dotfiles for different machines or contexts. Each profile has its own files, while <strong>Common Files</strong> are shared across all profiles.</p>
                             <ul>
                                 <li><strong>Create a profile:</strong> Press <kbd>C</kbd> in Manage Profiles</li>
-                                <li><strong>Copy from existing:</strong> When creating, choose an existing profile to start with — copies all files and packages</li>
+                                <li><strong>Inherit from existing:</strong> Set a parent profile — the child gets all parent files and you only override what's different (live link)</li>
+                                <li><strong>Copy from existing:</strong> One-time snapshot of an existing profile's files and packages</li>
                                 <li><strong>Switch profiles:</strong> Select a profile and press <kbd>Enter</kbd> — symlinks are swapped automatically</li>
                             </ul>
                             <p><strong>Example setups:</strong></p>
                             <ul>
                                 <li><strong>Multi-machine:</strong> <code>Personal</code> on your laptop, <code>Work</code> on your work machine, <code>Server</code> for headless setups</li>
                                 <li><strong>Same computer:</strong> <code>day</code>, <code>night</code>, or <code>focus</code> profiles with different terminal themes</li>
+                                <li><strong>Layered configs:</strong> <code>base</code> with core setup, then <code>work</code> and <code>personal</code> inherit from it — each only overrides what's different</li>
                             </ul>
                         </ExampleCard>
 

@@ -200,72 +200,9 @@ impl SymlinkManager {
         profile_name: &str,
         files: &[String],
     ) -> Result<Vec<SymlinkOperation>> {
-        let home_dir = crate::utils::get_home_dir();
-        self.activate_profile_with_home(profile_name, files, &home_dir)
-    }
-
-    fn activate_profile_with_home(
-        &mut self,
-        profile_name: &str,
-        files: &[String],
-        home_dir: &Path,
-    ) -> Result<Vec<SymlinkOperation>> {
-        info!("Activating profile: {}", profile_name);
-
-        // Create backup session if backups are enabled
-        if self.backup_enabled {
-            if let Some(ref backup_mgr) = self.backup_manager {
-                self.backup_session = Some(backup_mgr.create_backup_session()?);
-                info!("Created backup session: {:?}", self.backup_session);
-            }
-        }
-
-        let mut operations = Vec::new();
-        let profile_path = self.repo_path.join(profile_name);
-
-        if !profile_path.exists() {
-            return Err(anyhow::anyhow!(
-                "Profile directory does not exist: {profile_path:?}"
-            ));
-        }
-
-        for file in files {
-            let source = profile_path.join(file);
-            let target = home_dir.join(file);
-
-            let operation = self.create_symlink(&source, &target, file)?;
-            operations.push(operation);
-        }
-
-        // Update tracking
-        self.tracking.active_profile = profile_name.to_string();
-        for op in &operations {
-            // Track both Success AND Skipped (Skipped = symlink already correct, still ours)
-            if matches!(
-                op.status,
-                OperationStatus::Success | OperationStatus::Skipped(_)
-            ) {
-                // Check if already tracked (avoid duplicates)
-                let already_tracked = self.tracking.symlinks.iter().any(|s| s.target == op.target);
-                if !already_tracked {
-                    self.tracking.symlinks.push(TrackedSymlink {
-                        target: op.target.clone(),
-                        source: op.source.clone(),
-                        created_at: op.timestamp,
-                        backup: op.backup.clone(),
-                    });
-                }
-            }
-        }
-
-        self.save_tracking()?;
-        info!(
-            "Profile activated: {} ({} symlinks)",
-            profile_name,
-            operations.len()
-        );
-
-        Ok(operations)
+        let resolved =
+            crate::utils::profile_manifest::ResolvedFile::from_files(profile_name, files);
+        self.activate_resolved(profile_name, &resolved)
     }
 
     /// Activate a profile using resolved files from inheritance chain.
@@ -1213,134 +1150,9 @@ impl SymlinkManager {
         profile_name: &str,
         files: &[String],
     ) -> Result<(usize, usize, Vec<String>)> {
-        info!(
-            "Ensuring symlinks for profile '{}' ({} files)",
-            profile_name,
-            files.len()
-        );
-
-        let profile_path = self.repo_path.join(profile_name);
-        let home_dir = crate::utils::get_home_dir();
-
-        let mut created_count = 0;
-        let mut skipped_count = 0;
-        let mut errors = Vec::new();
-
-        // Create backup session if backups are enabled
-        if self.backup_enabled && self.backup_session.is_none() {
-            if let Some(ref backup_mgr) = self.backup_manager {
-                self.backup_session = Some(backup_mgr.create_backup_session()?);
-                debug!("Created backup session: {:?}", self.backup_session);
-            }
-        }
-
-        for relative_path in files {
-            let source = profile_path.join(relative_path);
-            let target = home_dir.join(relative_path);
-
-            // Check if source exists in repo
-            if !source.exists() {
-                debug!("Source file does not exist in repo, skipping: {:?}", source);
-                skipped_count += 1;
-                continue;
-            }
-
-            // Check if symlink already exists and points to the right place
-            if target.symlink_metadata().is_ok() {
-                if let Ok(metadata) = target.symlink_metadata() {
-                    if metadata.is_symlink() {
-                        // It's a symlink - check if it points to the right place
-                        if let Ok(existing_target) = fs::read_link(&target) {
-                            // Normalize paths for comparison
-                            let existing_normalized = if existing_target.is_absolute() {
-                                existing_target.canonicalize().unwrap_or(existing_target)
-                            } else {
-                                // Relative symlink - resolve relative to target's parent
-                                if let Some(parent) = target.parent() {
-                                    parent
-                                        .join(&existing_target)
-                                        .canonicalize()
-                                        .unwrap_or_else(|_| parent.join(&existing_target))
-                                } else {
-                                    existing_target
-                                }
-                            };
-
-                            let source_normalized = source.canonicalize().unwrap_or(source.clone());
-
-                            if existing_normalized == source_normalized {
-                                debug!(
-                                    "Symlink already exists and is correct, skipping: {:?}",
-                                    target
-                                );
-                                skipped_count += 1;
-                                continue;
-                            }
-                            debug!(
-                                "Symlink exists but points to wrong location: {:?} -> {:?} (expected: {:?})",
-                                target, existing_normalized, source_normalized
-                            );
-                        }
-                    } else {
-                        // Regular file exists at target location
-                        debug!(
-                            "Regular file exists at target location (not a symlink): {:?}",
-                            target
-                        );
-                        errors.push(format!("File exists at {relative_path} (not a symlink)"));
-                        continue;
-                    }
-                }
-            }
-
-            // Symlink doesn't exist or is incorrect - create it
-            debug!("Creating symlink: {:?} -> {:?}", target, source);
-            match self.create_symlink(&source, &target, relative_path) {
-                Ok(operation) => {
-                    if matches!(operation.status, OperationStatus::Success) {
-                        // Update tracking
-                        self.tracking.symlinks.push(TrackedSymlink {
-                            target: operation.target.clone(),
-                            source: operation.source.clone(),
-                            created_at: operation.timestamp,
-                            backup: operation.backup.clone(),
-                        });
-
-                        // Update active profile if not set
-                        if self.tracking.active_profile.is_empty() {
-                            self.tracking.active_profile = profile_name.to_string();
-                        }
-
-                        created_count += 1;
-                        info!("Created symlink for {}", relative_path);
-                    } else {
-                        warn!(
-                            "Failed to create symlink for {}: {:?}",
-                            relative_path, operation.status
-                        );
-                        errors.push(format!("Failed to create symlink for {relative_path}"));
-                    }
-                }
-                Err(e) => {
-                    error!("Error creating symlink for {}: {}", relative_path, e);
-                    errors.push(format!("Error for {relative_path}: {e}"));
-                }
-            }
-        }
-
-        // Save tracking if we created any symlinks
-        if created_count > 0 {
-            self.save_tracking()?;
-        }
-
-        info!(
-            "Symlink reconciliation complete: {} created, {} skipped, {} errors",
-            created_count,
-            skipped_count,
-            errors.len()
-        );
-
-        Ok((created_count, skipped_count, errors))
+        let resolved =
+            crate::utils::profile_manifest::ResolvedFile::from_files(profile_name, files);
+        self.ensure_resolved_symlinks(profile_name, &resolved)
     }
 
     /// Ensure all resolved files have their symlinks created.
@@ -1387,39 +1199,37 @@ impl SymlinkManager {
             }
 
             // Check if symlink already exists and points to the right place
-            if target.symlink_metadata().is_ok() {
-                if let Ok(metadata) = target.symlink_metadata() {
-                    if metadata.is_symlink() {
-                        if let Ok(existing_target) = fs::read_link(&target) {
-                            let existing_normalized = if existing_target.is_absolute() {
-                                existing_target.canonicalize().unwrap_or(existing_target)
-                            } else if let Some(parent) = target.parent() {
-                                parent
-                                    .join(&existing_target)
-                                    .canonicalize()
-                                    .unwrap_or_else(|_| parent.join(&existing_target))
-                            } else {
-                                existing_target
-                            };
+            if let Ok(metadata) = target.symlink_metadata() {
+                if metadata.is_symlink() {
+                    if let Ok(existing_target) = fs::read_link(&target) {
+                        let existing_normalized = if existing_target.is_absolute() {
+                            existing_target.canonicalize().unwrap_or(existing_target)
+                        } else if let Some(parent) = target.parent() {
+                            parent
+                                .join(&existing_target)
+                                .canonicalize()
+                                .unwrap_or_else(|_| parent.join(&existing_target))
+                        } else {
+                            existing_target
+                        };
 
-                            let source_normalized = source.canonicalize().unwrap_or(source.clone());
+                        let source_normalized = source.canonicalize().unwrap_or(source.clone());
 
-                            if existing_normalized == source_normalized {
-                                debug!(
-                                    "Symlink already exists and is correct, skipping: {:?}",
-                                    target
-                                );
-                                skipped_count += 1;
-                                continue;
-                            }
+                        if existing_normalized == source_normalized {
+                            debug!(
+                                "Symlink already exists and is correct, skipping: {:?}",
+                                target
+                            );
+                            skipped_count += 1;
+                            continue;
                         }
-                    } else {
-                        errors.push(format!(
-                            "File exists at {} (not a symlink)",
-                            resolved.relative_path
-                        ));
-                        continue;
                     }
+                } else {
+                    errors.push(format!(
+                        "File exists at {} (not a symlink)",
+                        resolved.relative_path
+                    ));
+                    continue;
                 }
             }
 
@@ -1899,11 +1709,12 @@ mod tests {
         let symlink_target = temp_dir.path().join(".testrc");
 
         // Activate profile
-        let result = manager.activate_profile_with_home(
-            "test-profile",
-            &[".testrc".to_string()],
-            temp_dir.path(),
-        );
+        let resolved = vec![crate::utils::profile_manifest::ResolvedFile {
+            relative_path: ".testrc".to_string(),
+            source_profile: "test-profile".to_string(),
+        }];
+        let result =
+            manager.activate_resolved_with_home("test-profile", &resolved, temp_dir.path());
         assert!(result.is_ok(), "activate_profile error: {:?}", result.err());
 
         let operations = result.unwrap();

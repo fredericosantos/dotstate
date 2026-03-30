@@ -41,6 +41,7 @@ Managing dotfiles can be a pain. You want your `.zshrc`, `.vimrc`, and other con
 - **Built-in backups** - Your files are safe before any operation
 - **One-command setup** - Get started in seconds
 - **Profile support** - Separate configs for work, personal, Mac, Linux, etc.
+- **Profile inheritance** - Extend a parent profile and override only what differs
 - **Package management** - Track and install CLI tools per profile
 - **Beautiful TUI** - Visual interface with mouse support
 
@@ -49,6 +50,7 @@ Managing dotfiles can be a pain. You want your `.zshrc`, `.vimrc`, and other con
 ### 🎯 Core Features
 
 - **Profile Management**: Create separate profiles for different contexts (work, personal, Mac, Linux, etc.)
+- **Profile Inheritance**: Have a profile extend another — child files override parent files, so you only define what's different
 - **Common Files Support**: Share dotfiles (like `.gitconfig` or `.tmux.conf`) across all profiles automatically.
 - **Flexible Git Sync**: Automatic sync with GitHub, GitLab, Bitbucket, or any git host
 - **Two Setup Modes**: Let DotState create a GitHub repo for you, or use your own repository
@@ -204,8 +206,9 @@ Then add `fpath=(~/.zsh/completions $fpath)` to your .zshrc before your framewor
 1. **Storage**: Your dotfiles are stored in a Git repository (default: `~/.config/dotstate/storage`)
 2. **Symlinks**: Original files are replaced with symlinks pointing to the repo
 3. **Profiles**: Different profiles can have different sets of files
-4. **Common Files**: Files that are shared across all profiles are stored in the `common` section and linked regardless of the active profile
-5. **Sync**: Changes are committed and synced with GitHub automatically
+4. **Inheritance**: Profiles can inherit from a parent — child files override parent files, common files have the lowest priority
+5. **Common Files**: Files that are shared across all profiles are stored in the `common` section and linked regardless of the active profile
+6. **Sync**: Changes are committed and synced with GitHub automatically
 
 ## Working with Profiles
 
@@ -240,11 +243,39 @@ Profiles are how DotState organizes your dotfiles for different machines or cont
 In the TUI, go to **Manage Profiles** and press `C` to create a new profile. You can:
 
 - **Start blank** for a completely new setup
-- **Copy from an existing profile** to carry over files and packages — great for setting up a similar machine quickly
+- **Inherit from an existing profile** to create a live link — the child automatically gets all parent files and packages, and you only override what's different
+- **Copy from an existing profile** to carry over files and packages as a one-time snapshot — great for setting up a similar machine quickly
+
+**Inherit vs Copy:** Inheritance is a live relationship — changes to the parent are reflected in the child. Copy is a one-time fork — after creation, the two profiles are independent.
+
+### Profile Inheritance
+
+A profile can inherit from one parent. When activated, DotState resolves files from the full chain:
+
+1. **Child's own files** (highest priority)
+2. **Parent's files** (inherited unless overridden)
+3. **Grandparent's files**, etc.
+4. **Common files** (lowest priority)
+
+```
+          base
+           │  .zshrc, .vimrc, .tmux.conf
+           │
+         work (inherits base)
+           │  .zshrc (overrides base's)
+           │  .ssh/config (own)
+           │
+       work-laptop (inherits work)
+              .ssh/config (overrides work's)
+```
+
+In this example, `work-laptop` gets: its own `.ssh/config`, work's `.zshrc`, and base's `.vimrc` and `.tmux.conf`.
+
+Cycles are detected and rejected. Profiles that are inherited by others cannot be deleted until the inheritance is removed.
 
 ### Switching Profiles
 
-Select a profile and press `Enter` to switch. DotState will remove symlinks for the old profile and create symlinks for the new one automatically. Common files stay linked regardless of which profile is active.
+Select a profile and press `Enter` to switch. DotState will remove symlinks for the old profile and create symlinks for the new one automatically (including inherited files). Common files stay linked regardless of which profile is active. If activation fails, the old profile is automatically restored.
 
 ### Common Files
 
@@ -258,6 +289,7 @@ You decide which files are shared. Move any file to **Common** and it will be sy
 
 - **Multi-machine**: Use a `Personal` profile on your laptop, `Work` on your work machine, and `Server` for headless setups. Keep shared configs (`.gitconfig`, `.tmux.conf`) in Common.
 - **Same computer, different contexts**: Create profiles like `day`, `night`, or `focus` with different terminal themes and defaults, and switch between them instantly.
+- **Layered configs with inheritance**: Create a `base` profile with your core setup, then have `work` and `personal` inherit from it — each only overrides what's different (like `.zshrc` or `.ssh/config`). Changes to `base` automatically flow to all children.
 - **Quick duplication**: When setting up a second machine, create a new profile by copying from an existing one, then tweak what's different.
 
 ## Configuration
