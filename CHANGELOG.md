@@ -23,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Packages**: Moving a package between the profile and common lists now carries its cached install status to the new list and removes the stale entry from the old one. If nothing was cached, a status check starts instead of leaving the package `Unknown` (and skipped by install) until a manual check
 - **Packages**: Moving a package between the profile and common lists now keeps the cached status's original `last_checked` time instead of stamping it as freshly checked; an existing cache entry in the destination scope is overwritten by the moved one
 - **Packages**: Section headers in the Manage Packages list can no longer be selected (keyboard, scroll or click), and the selected package now stays selected across add/edit/delete/move instead of drifting to a different row or a header; a newly added or edited package is selected, and a deleted or moved one falls back to the nearest package
+- **Packages**: Mouse-wheel scrolling in Manage Packages moves the selection 3 packages per tick and skips section headers (same step as Dotfile Selection), instead of counting headers as rows
+- **Packages**: After moving a package between the profile and common lists, the selection follows it into its new section instead of falling back to a neighbour
 
 ---
 

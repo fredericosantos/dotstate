@@ -1023,48 +1023,12 @@ impl App {
                     .packages
                     .get(index)
                     .map(|p| p.name.clone());
-                match crate::services::PackageService::move_package_to_common(
+                let result = crate::services::PackageService::move_package_to_common(
                     &self.config.repo_path,
                     &self.config.active_profile,
                     index,
-                ) {
-                    Ok((common_packages, profile_packages)) => {
-                        // Carry the cached status to the new scope (dropping the stale old
-                        // entry) before the screen rebuilds its statuses from the cache.
-                        // With nothing cached the package is Unknown, so start a check.
-                        let carried = moved_name.is_some_and(|name| {
-                            match self.manage_packages_screen.state.cache.move_status(
-                                &self.config.active_profile,
-                                "common",
-                                &name,
-                            ) {
-                                Ok(carried) => carried,
-                                Err(e) => {
-                                    warn!("Failed to move package cache entry: {}", e);
-                                    false
-                                }
-                            }
-                        });
-                        self.manage_packages_screen.update_all_packages(
-                            common_packages,
-                            profile_packages,
-                            &self.config.active_profile,
-                        );
-                        if !carried {
-                            self.manage_packages_screen.start_checking();
-                        }
-                        self.toast_manager.push(crate::widgets::Toast::new(
-                            "Package moved to common".to_string(),
-                            crate::widgets::ToastVariant::Success,
-                        ));
-                    }
-                    Err(e) => {
-                        self.toast_manager.push(crate::widgets::Toast::new(
-                            format!("Failed to move package: {e}"),
-                            crate::widgets::ToastVariant::Error,
-                        ));
-                    }
-                }
+                );
+                self.finish_package_move(result, moved_name.as_deref(), true);
             }
             ScreenAction::MovePackageFromCommon { index } => {
                 let moved_name = self
@@ -1073,48 +1037,12 @@ impl App {
                     .common_packages
                     .get(index)
                     .map(|p| p.name.clone());
-                match crate::services::PackageService::move_package_from_common(
+                let result = crate::services::PackageService::move_package_from_common(
                     &self.config.repo_path,
                     &self.config.active_profile,
                     index,
-                ) {
-                    Ok((common_packages, profile_packages)) => {
-                        // Carry the cached status to the new scope (dropping the stale old
-                        // entry) before the screen rebuilds its statuses from the cache.
-                        // With nothing cached the package is Unknown, so start a check.
-                        let carried = moved_name.is_some_and(|name| {
-                            match self.manage_packages_screen.state.cache.move_status(
-                                "common",
-                                &self.config.active_profile,
-                                &name,
-                            ) {
-                                Ok(carried) => carried,
-                                Err(e) => {
-                                    warn!("Failed to move package cache entry: {}", e);
-                                    false
-                                }
-                            }
-                        });
-                        self.manage_packages_screen.update_all_packages(
-                            common_packages,
-                            profile_packages,
-                            &self.config.active_profile,
-                        );
-                        if !carried {
-                            self.manage_packages_screen.start_checking();
-                        }
-                        self.toast_manager.push(crate::widgets::Toast::new(
-                            "Package moved to profile".to_string(),
-                            crate::widgets::ToastVariant::Success,
-                        ));
-                    }
-                    Err(e) => {
-                        self.toast_manager.push(crate::widgets::Toast::new(
-                            format!("Failed to move package: {e}"),
-                            crate::widgets::ToastVariant::Error,
-                        ));
-                    }
-                }
+                );
+                self.finish_package_move(result, moved_name.as_deref(), false);
             }
             ScreenAction::UpdateSetting {
                 setting,
@@ -1748,15 +1676,50 @@ impl App {
     /// Helper: Load common packages; on failure log, show an error toast and return an
     /// empty list so the Manage Packages screen still renders.
     fn load_common_packages_or_toast(&mut self) -> Vec<crate::utils::profile_manifest::Package> {
-        match crate::services::PackageService::get_common_packages(&self.config.repo_path) {
-            Ok(packages) => packages,
-            Err(e) => {
-                warn!("Failed to load common packages: {}", e);
+        let (packages, error) = load_common_packages(&self.config.repo_path);
+        if let Some(message) = error {
+            self.toast_manager
+                .push(Toast::new(message, crate::widgets::ToastVariant::Error));
+        }
+        packages
+    }
+
+    /// Helper: finish a package move between the profile and common lists. On success updates
+    /// the Manage Packages screen (cache carry, selection, status check) and shows a toast; on
+    /// failure shows an error toast and leaves the screen untouched.
+    fn finish_package_move(
+        &mut self,
+        result: Result<(
+            Vec<crate::utils::profile_manifest::Package>,
+            Vec<crate::utils::profile_manifest::Package>,
+        )>,
+        moved_name: Option<&str>,
+        to_common: bool,
+    ) {
+        match result {
+            Ok((common_packages, profile_packages)) => {
+                self.manage_packages_screen.apply_package_move(
+                    moved_name,
+                    to_common,
+                    common_packages,
+                    profile_packages,
+                    &self.config.active_profile,
+                );
+                let message = if to_common {
+                    "Package moved to common"
+                } else {
+                    "Package moved to profile"
+                };
                 self.toast_manager.push(Toast::new(
-                    format!("Failed to load common packages: {e}"),
+                    message.to_string(),
+                    crate::widgets::ToastVariant::Success,
+                ));
+            }
+            Err(e) => {
+                self.toast_manager.push(Toast::new(
+                    format!("Failed to move package: {e}"),
                     crate::widgets::ToastVariant::Error,
                 ));
-                Vec::new()
             }
         }
     }
@@ -1794,5 +1757,76 @@ impl App {
             self.config.embed_credentials_in_url
         );
         Ok(())
+    }
+}
+
+/// Load the common packages from the manifest in `repo_path`.
+///
+/// Returns `(packages, error_message)`. On failure (e.g. a corrupt manifest) the list is empty,
+/// so the Manage Packages screen still renders, and the message is the user-facing text for an
+/// error toast. Kept free of `App` so it can be unit-tested.
+fn load_common_packages(
+    repo_path: &std::path::Path,
+) -> (Vec<crate::utils::profile_manifest::Package>, Option<String>) {
+    match crate::services::PackageService::get_common_packages(repo_path) {
+        Ok(packages) => (packages, None),
+        Err(e) => {
+            warn!("Failed to load common packages: {}", e);
+            (
+                Vec::new(),
+                Some(format!("Failed to load common packages: {e}")),
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::profile_manifest::{Package, PackageManager};
+    use crate::utils::ProfileManifest;
+
+    fn custom_package(name: &str) -> Package {
+        Package {
+            name: name.to_string(),
+            description: None,
+            manager: PackageManager::Custom,
+            package_name: None,
+            binary_name: name.to_string(),
+            install_command: None,
+            existence_check: Some("true".to_string()),
+            manager_check: None,
+        }
+    }
+
+    #[test]
+    fn load_common_packages_reports_corrupt_manifest() {
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::write(
+            ProfileManifest::manifest_path(repo.path()),
+            "this is [not valid toml",
+        )
+        .unwrap();
+
+        let (packages, error) = load_common_packages(repo.path());
+        assert!(packages.is_empty());
+        let message = error.expect("a corrupt manifest must produce an error message");
+        assert!(
+            message.starts_with("Failed to load common packages: "),
+            "unexpected message: {message}"
+        );
+    }
+
+    #[test]
+    fn load_common_packages_returns_packages_without_error() {
+        let repo = tempfile::tempdir().unwrap();
+        let mut manifest = ProfileManifest::default();
+        assert!(manifest.add_common_package(custom_package("ripgrep")));
+        manifest.save(repo.path()).unwrap();
+
+        let (packages, error) = load_common_packages(repo.path());
+        assert_eq!(error, None);
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].name, "ripgrep");
     }
 }
