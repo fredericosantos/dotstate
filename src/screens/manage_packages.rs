@@ -23,6 +23,13 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Padding, Paragraph, Tabs,
 use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
+/// Packages the selection moves per mouse-wheel tick. Headers are skipped and never counted.
+/// Three matches every other scrolling list in the app (`dotfile_selection`, `settings`,
+/// `profile_selection` and this screen's import popup all step 3 entries per tick), and like
+/// `dotfile_selection` it counts selectable entries rather than terminal rows, so a tick
+/// moves the same number of packages whether or not it crosses a section header.
+const WHEEL_STEP: isize = 3;
+
 /// Flat list item for the package list, combining common and profile packages with section headers.
 #[derive(Debug, Clone)]
 enum DisplayItem {
@@ -92,28 +99,6 @@ impl ManagePackagesScreen {
         &mut self.state
     }
 
-    pub fn update_packages(&mut self, packages: Vec<Package>, active_profile: &str) {
-        let previous = self.remember_selection();
-        self.state.packages = packages;
-        self.state.active_profile = active_profile.to_string();
-
-        // Initialize statuses from cache
-        let mut statuses = Vec::with_capacity(self.state.packages.len());
-        for package in &self.state.packages {
-            if let Some(entry) = self.state.cache.get_status(active_profile, &package.name) {
-                if entry.installed {
-                    statuses.push(PackageStatus::Installed);
-                } else {
-                    statuses.push(PackageStatus::NotInstalled);
-                }
-            } else {
-                statuses.push(PackageStatus::Unknown);
-            }
-        }
-        self.state.package_statuses = statuses;
-        self.restore_selection(previous);
-    }
-
     /// Update both common and profile packages at once.
     pub fn update_all_packages(
         &mut self,
@@ -156,6 +141,44 @@ impl ManagePackagesScreen {
         self.state.packages = profile_packages;
         self.state.package_statuses = profile_statuses;
         self.restore_selection(previous);
+    }
+
+    /// Apply the screen-side result of a package move between the profile and common lists.
+    ///
+    /// Carries the package's cached status from its old scope to the new one (dropping the stale
+    /// entry), rebuilds the lists (statuses come from the cache) and selects the moved package in
+    /// its destination section. With no cached status to carry, the package is `Unknown`, so a
+    /// status check is started. `moved_name` is `None` only if the source index was stale; nothing
+    /// is carried or selected then. `to_common` is the direction of the move.
+    pub fn apply_package_move(
+        &mut self,
+        moved_name: Option<&str>,
+        to_common: bool,
+        common_packages: Vec<Package>,
+        profile_packages: Vec<Package>,
+        active_profile: &str,
+    ) {
+        let (from_scope, to_scope) = if to_common {
+            (active_profile, "common")
+        } else {
+            ("common", active_profile)
+        };
+        let carried = moved_name.is_some_and(|name| {
+            match self.state.cache.move_status(from_scope, to_scope, name) {
+                Ok(carried) => carried,
+                Err(e) => {
+                    warn!("Failed to move package cache entry: {}", e);
+                    false
+                }
+            }
+        });
+        self.update_all_packages(common_packages, profile_packages, active_profile);
+        if let Some(name) = moved_name {
+            self.select_package_by_name(to_common, name);
+        }
+        if !carried {
+            self.start_checking();
+        }
     }
 
     /// Identify the selected package (scope, index within scope, name) so the selection can be
@@ -973,7 +996,7 @@ impl ManagePackagesScreen {
                 if let Some(area) = self.list_pane_area {
                     let pos = ratatui::layout::Position::new(mouse.column, mouse.row);
                     if area.contains(pos) && !self.state.is_checking {
-                        self.move_selection(3);
+                        self.move_selection(WHEEL_STEP);
                         return Ok(ScreenAction::Refresh);
                     }
                 }
@@ -982,7 +1005,7 @@ impl ManagePackagesScreen {
                 if let Some(area) = self.list_pane_area {
                     let pos = ratatui::layout::Position::new(mouse.column, mouse.row);
                     if area.contains(pos) && !self.state.is_checking {
-                        self.move_selection(-3);
+                        self.move_selection(-WHEEL_STEP);
                         return Ok(ScreenAction::Refresh);
                     }
                 }
@@ -3977,5 +4000,141 @@ mod tests {
             PackageStatus::NotInstalled
         ));
         assert_eq!(screen.state.popup_type, PackagePopupType::InstallMissing);
+    }
+
+    #[test]
+    fn apply_package_move_to_common_carries_status_and_selects_package() {
+        let (mut screen, _tmp) = screen_with(&[], &["p0", "p1"]);
+        screen
+            .state
+            .cache
+            .update_status("main", "p1", true, Some("true".to_string()), None)
+            .unwrap();
+        // Make the `checking_is_common` default (true) distinguishable from a started check.
+        screen.state.checking_is_common = false;
+
+        // Service result after moving p1: common = [p1], profile = [p0].
+        screen.apply_package_move(
+            Some("p1"),
+            true,
+            vec![custom_package("p1", "true")],
+            vec![custom_package("p0", "true")],
+            "main",
+        );
+
+        assert_eq!(selected(&screen), sel(true, "p1"));
+        assert!(matches!(
+            screen.state.common_package_statuses[0],
+            PackageStatus::Installed
+        ));
+        assert!(
+            screen
+                .state
+                .cache
+                .get_status("common", "p1")
+                .unwrap()
+                .installed
+        );
+        assert!(screen.state.cache.get_status("main", "p1").is_none());
+        // A status was carried, so no check is started.
+        assert!(!screen.state.is_checking);
+        assert!(!screen.state.checking_is_common);
+    }
+
+    #[test]
+    fn apply_package_move_from_common_without_cache_selects_and_starts_check() {
+        let (mut screen, _tmp) = screen_with(&["c0", "c1"], &["p0"]);
+        screen.state.checking_is_common = false;
+        assert!(!screen.state.is_checking);
+
+        // Service result after moving c0 to the profile: common = [c1], profile = [c0, p0].
+        screen.apply_package_move(
+            Some("c0"),
+            false,
+            vec![custom_package("c1", "true")],
+            vec![custom_package("c0", "true"), custom_package("p0", "true")],
+            "main",
+        );
+
+        assert_eq!(selected(&screen), sel(false, "c0"));
+        assert!(matches!(
+            screen.state.package_statuses[0],
+            PackageStatus::Unknown
+        ));
+        assert!(screen.state.cache.get_status("common", "c0").is_none());
+        assert!(screen.state.cache.get_status("main", "c0").is_none());
+        // Nothing to carry: a check starts, beginning with the common list.
+        assert!(screen.state.is_checking);
+        assert!(screen.state.checking_is_common);
+    }
+
+    #[test]
+    fn apply_package_move_moving_last_package_out_of_section_follows_it() {
+        // The only common package moves to the profile: the common section disappears and the
+        // selection must land on the moved package, not on a neighbour.
+        let (mut screen, _tmp) = screen_with(&["c0"], &["p0"]);
+        screen
+            .state
+            .cache
+            .update_status("common", "c0", false, None, None)
+            .unwrap();
+
+        screen.apply_package_move(
+            Some("c0"),
+            false,
+            Vec::new(),
+            vec![custom_package("c0", "true"), custom_package("p0", "true")],
+            "main",
+        );
+
+        assert_eq!(selected(&screen), sel(false, "c0"));
+        assert!(matches!(
+            screen.state.package_statuses[0],
+            PackageStatus::NotInstalled
+        ));
+        assert!(screen.state.cache.get_status("common", "c0").is_none());
+        assert!(!screen.state.is_checking);
+    }
+
+    #[test]
+    fn mouse_wheel_moves_three_packages_skipping_headers() {
+        use crossterm::event::MouseEvent;
+
+        // Rows: [Hc, c0, c1, Hp, p0, p1, p2]
+        let (mut screen, _tmp) = screen_with(&["c0", "c1"], &["p0", "p1", "p2"]);
+        screen.list_pane_area = Some(Rect::new(0, 0, 40, 20));
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        screen
+            .handle_mouse_event(wheel(MouseEventKind::ScrollDown))
+            .unwrap();
+        assert_eq!(selected(&screen), sel(false, "p1")); // c0 -> c1, p0, p1 (crosses the header)
+        screen
+            .handle_mouse_event(wheel(MouseEventKind::ScrollDown))
+            .unwrap();
+        assert_eq!(selected(&screen), sel(false, "p2")); // clamped at the last package
+        screen
+            .handle_mouse_event(wheel(MouseEventKind::ScrollUp))
+            .unwrap();
+        assert_eq!(selected(&screen), sel(true, "c1")); // p1, p0, c1 (crosses header)
+        screen
+            .handle_mouse_event(wheel(MouseEventKind::ScrollUp))
+            .unwrap();
+        assert_eq!(selected(&screen), sel(true, "c0"));
+
+        // Outside the list pane the wheel does nothing.
+        let outside = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 50,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        screen.handle_mouse_event(outside).unwrap();
+        assert_eq!(selected(&screen), sel(true, "c0"));
     }
 }
