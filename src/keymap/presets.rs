@@ -188,7 +188,9 @@ fn emacs_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("d", Action::Delete), // Use 'd' since Ctrl+D is DeleteChar in Emacs
         KeyBinding::new("ctrl+e", Action::Edit),
         KeyBinding::new("ctrl+o", Action::Create),
-        KeyBinding::new("ctrl+shift+o", Action::CreateCommon),
+        // Plain-terminal safe: Ctrl+Shift+<letter> is indistinguishable from Ctrl+<letter>
+        // without the kitty keyboard protocol, so it would be shadowed by ctrl+o (Create).
+        KeyBinding::new("shift+o", Action::CreateCommon),
         KeyBinding::new("/", Action::Search), // Use / for search (Ctrl+S is used for Save)
         KeyBinding::new("ctrl+r", Action::Refresh),
         KeyBinding::new("ctrl+r", Action::Refresh),
@@ -264,6 +266,71 @@ mod tests {
         assert!(bindings
             .iter()
             .any(|b| b.key == "ctrl+p" && b.action == Action::MoveUp));
+    }
+
+    /// Actions handled by the Manage Packages list view (no popup open).
+    const MANAGE_PACKAGES_ACTIONS: &[Action] = &[
+        Action::MoveUp,
+        Action::MoveDown,
+        Action::Refresh,
+        Action::CheckStatus,
+        Action::Install,
+        Action::Create,
+        Action::CreateCommon,
+        Action::Edit,
+        Action::Delete,
+        Action::Move,
+        Action::Import,
+        Action::Cancel,
+        Action::Quit,
+    ];
+
+    /// Key as a plain terminal delivers it: without the kitty keyboard protocol,
+    /// Ctrl+Shift+<letter> arrives as the same byte as Ctrl+<letter>.
+    fn plain_terminal_key(
+        key: &str,
+    ) -> (crossterm::event::KeyCode, crossterm::event::KeyModifiers) {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let parsed = super::super::binding::parse_key_string(key)
+            .unwrap_or_else(|e| panic!("unparsable binding {key:?}: {e}"));
+        let mut mods = parsed.modifiers;
+        if mods.contains(KeyModifiers::CONTROL) && matches!(parsed.code, KeyCode::Char(_)) {
+            mods.remove(KeyModifiers::SHIFT);
+        }
+        (parsed.code, mods)
+    }
+
+    #[test]
+    fn test_manage_packages_bindings_have_no_collisions() {
+        use std::collections::HashMap;
+        for preset in [
+            KeymapPreset::Standard,
+            KeymapPreset::Vim,
+            KeymapPreset::Emacs,
+        ] {
+            let mut seen: HashMap<_, (Action, String)> = HashMap::new();
+            for b in preset
+                .bindings()
+                .into_iter()
+                .filter(|b| MANAGE_PACKAGES_ACTIONS.contains(&b.action))
+                // Emacs chords ("ctrl+x s") are unparsable placeholders that never match.
+                .filter(|b| !b.key.contains(' '))
+            {
+                let key = plain_terminal_key(&b.key);
+                if let Some((other, other_key)) = seen.insert(key, (b.action, b.key.clone())) {
+                    assert_eq!(
+                        other,
+                        b.action,
+                        "{}: {:?} ({}) collides with {:?} ({})",
+                        preset.name(),
+                        b.action,
+                        b.key,
+                        other,
+                        other_key
+                    );
+                }
+            }
+        }
     }
 
     #[test]

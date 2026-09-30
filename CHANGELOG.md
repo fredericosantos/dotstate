@@ -9,7 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Common Packages**: Packages can now be stored in a shared `[common]` section (like common files), visible across all profiles. TUI shows two sections ("Common Packages" and "Profile Packages") with section headers; `m` moves a package between sections. New keymap action `CreateCommon` (`Shift+C` / `Shift+O` / `Ctrl+Shift+O`) adds directly to common
+- **Common Packages**: Packages can now be stored in a shared `[common]` section (like common files), visible across all profiles. TUI shows two sections ("Common Packages" and "Profile Packages") with section headers; `m` moves a package between sections. New keymap action `CreateCommon` (`Shift+C` Standard, `Shift+O` Vim/Emacs) adds directly to common
+- **Keymap**: Emacs `CreateCommon` is `Shift+O` instead of `Ctrl+Shift+O`, which plain terminals deliver as `Ctrl+O` (the Create binding) and so was unreachable; added a test that Manage Packages actions never share a key within a preset
 - **CLI `--common` flag**: All `dotstate packages` subcommands (`list`, `add`, `remove`, `check`, `install`) accept `--common` to operate on the shared package list instead of a profile
 
 ### Fixed

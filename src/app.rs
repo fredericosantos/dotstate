@@ -382,9 +382,7 @@ impl App {
                     .flatten()
                     .map(|p| p.packages.clone())
                     .unwrap_or_default();
-                let common_packages =
-                    crate::services::PackageService::get_common_packages(&self.config.repo_path)
-                        .unwrap_or_default();
+                let common_packages = self.load_common_packages_or_toast();
 
                 self.manage_packages_screen.update_all_packages(
                     common_packages,
@@ -954,9 +952,7 @@ impl App {
                     } else {
                         Vec::new()
                     };
-                let common_packages =
-                    crate::services::PackageService::get_common_packages(&self.config.repo_path)
-                        .unwrap_or_default();
+                let common_packages = self.load_common_packages_or_toast();
                 self.manage_packages_screen.update_all_packages(
                     common_packages,
                     profile_packages,
@@ -1747,6 +1743,22 @@ impl App {
     #[allow(dead_code)]
     fn load_manifest(&self) -> Result<crate::utils::ProfileManifest> {
         crate::services::ProfileService::load_manifest(&self.config.repo_path)
+    }
+
+    /// Helper: Load common packages; on failure log, show an error toast and return an
+    /// empty list so the Manage Packages screen still renders.
+    fn load_common_packages_or_toast(&mut self) -> Vec<crate::utils::profile_manifest::Package> {
+        match crate::services::PackageService::get_common_packages(&self.config.repo_path) {
+            Ok(packages) => packages,
+            Err(e) => {
+                warn!("Failed to load common packages: {}", e);
+                self.toast_manager.push(Toast::new(
+                    format!("Failed to load common packages: {e}"),
+                    crate::widgets::ToastVariant::Error,
+                ));
+                Vec::new()
+            }
+        }
     }
 
     /// Helper: Get active profile info from manifest
