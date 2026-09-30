@@ -180,26 +180,40 @@ impl PackageCache {
 
     /// Move a package's cached status from one scope to another (e.g. profile -> "common").
     ///
-    /// The new entry keeps the old installed flag, check command and output; the old entry is
-    /// removed. Returns `true` if an old entry existed and was carried over, `false` if there
-    /// was nothing to carry (the package is then `Unknown` in its new scope).
+    /// The raw entry is moved under the new key, so it keeps its original `last_checked`
+    /// timestamp, installed flag, check command and output (an old status does not look freshly
+    /// checked). The cache file is written once. If an entry already exists under the destination
+    /// key it is overwritten: the moved entry describes the package that actually moved.
+    ///
+    /// Returns `true` if an old entry existed and was moved. Returns `false` without writing if
+    /// there was nothing to move (the package is then `Unknown` in its new scope). If persisting
+    /// fails, the in-memory cache is restored to its previous state.
     pub fn move_status(
         &mut self,
         from_scope: &str,
         to_scope: &str,
         package_name: &str,
     ) -> Result<bool> {
-        let Some(old) = self.get_status(from_scope, package_name).cloned() else {
+        let from_key = Self::get_key(from_scope, package_name);
+        let to_key = Self::get_key(to_scope, package_name);
+        if from_key == to_key {
+            // Same scope: nothing to move.
+            return Ok(self.data.entries.contains_key(&from_key));
+        }
+        let Some(entry) = self.data.entries.remove(&from_key) else {
             return Ok(false);
         };
-        self.update_status(
-            to_scope,
-            package_name,
-            old.installed,
-            old.check_command,
-            old.output,
-        )?;
-        self.remove_status(from_scope, package_name)?;
+        let replaced = self.data.entries.insert(to_key.clone(), entry);
+        if let Err(e) = self.save() {
+            if let Some(entry) = self.data.entries.remove(&to_key) {
+                self.data.entries.insert(from_key, entry);
+            }
+            if let Some(replaced) = replaced {
+                self.data.entries.insert(to_key, replaced);
+            }
+            return Err(e);
+        }
+        debug!("Moved cache entry {} -> {}", from_key, to_key);
         Ok(true)
     }
 
@@ -230,11 +244,106 @@ impl PackageCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+
+    fn cache_in(tmp: &tempfile::TempDir) -> PackageCache {
+        PackageCache::with_path(tmp.path().join("package_status.json"))
+    }
+
+    fn entry_at(
+        installed: bool,
+        last_checked: DateTime<Utc>,
+        cmd: &str,
+        out: &str,
+    ) -> PackageCacheEntry {
+        PackageCacheEntry {
+            installed,
+            last_checked,
+            check_command: Some(cmd.to_string()),
+            output: Some(out.to_string()),
+        }
+    }
+
+    fn read_disk(cache: &PackageCache) -> PackageCacheData {
+        serde_json::from_str(&std::fs::read_to_string(&cache.cache_file).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn move_status_preserves_last_checked_exactly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cache = cache_in(&tmp);
+        let old = Utc.with_ymd_and_hms(2020, 1, 2, 3, 4, 5).unwrap();
+        cache
+            .data
+            .entries
+            .insert("main::git".into(), entry_at(false, old, "git -v", "nope"));
+
+        assert!(cache.move_status("main", "common", "git").unwrap());
+        let moved = cache.get_status("common", "git").unwrap();
+        assert_eq!(moved.last_checked, old);
+        assert!(!moved.installed);
+        assert_eq!(moved.check_command.as_deref(), Some("git -v"));
+        assert_eq!(moved.output.as_deref(), Some("nope"));
+
+        let disk = read_disk(&cache);
+        assert_eq!(disk.entries["common::git"].last_checked, old);
+        assert!(!disk.entries.contains_key("main::git"));
+    }
+
+    #[test]
+    fn move_status_overwrites_existing_destination() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cache = cache_in(&tmp);
+        let moved_at = Utc.with_ymd_and_hms(2021, 6, 7, 8, 9, 10).unwrap();
+        let dest_at = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        cache.data.entries.insert(
+            "main::vim".into(),
+            entry_at(true, moved_at, "src", "src-out"),
+        );
+        cache.data.entries.insert(
+            "common::vim".into(),
+            entry_at(false, dest_at, "dst", "dst-out"),
+        );
+
+        assert!(cache.move_status("main", "common", "vim").unwrap());
+        assert!(cache.get_status("main", "vim").is_none());
+        let got = cache.get_status("common", "vim").unwrap();
+        assert!(got.installed);
+        assert_eq!(got.last_checked, moved_at);
+        assert_eq!(got.check_command.as_deref(), Some("src"));
+        assert_eq!(got.output.as_deref(), Some("src-out"));
+    }
+
+    #[test]
+    fn move_status_missing_source_returns_false_and_leaves_file_untouched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cache = cache_in(&tmp);
+
+        // No cache file yet: a missing source must not create one.
+        assert!(!cache.move_status("main", "common", "missing").unwrap());
+        assert!(!cache.cache_file.exists());
+
+        // With an existing file: bytes are identical afterwards, destination untouched.
+        cache
+            .update_status("common", "missing", true, None, Some("keep".into()))
+            .unwrap();
+        let before = std::fs::read(&cache.cache_file).unwrap();
+        assert!(!cache.move_status("main", "common", "missing").unwrap());
+        assert_eq!(std::fs::read(&cache.cache_file).unwrap(), before);
+        assert_eq!(
+            cache
+                .get_status("common", "missing")
+                .unwrap()
+                .output
+                .as_deref(),
+            Some("keep")
+        );
+    }
 
     #[test]
     fn move_status_carries_entry_and_removes_old_scope() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut cache = PackageCache::with_path(tmp.path().join("package_status.json"));
+        let mut cache = cache_in(&tmp);
         cache
             .update_status(
                 "main",
@@ -244,6 +353,7 @@ mod tests {
                 Some("/usr/bin/curl".to_string()),
             )
             .unwrap();
+        let original = cache.get_status("main", "curl").unwrap().last_checked;
 
         assert!(cache.move_status("main", "common", "curl").unwrap());
         assert!(cache.get_status("main", "curl").is_none());
@@ -251,6 +361,12 @@ mod tests {
         assert!(moved.installed);
         assert_eq!(moved.check_command.as_deref(), Some("which curl"));
         assert_eq!(moved.output.as_deref(), Some("/usr/bin/curl"));
+        assert_eq!(moved.last_checked, original);
+
+        // Persisted to disk too.
+        let disk = read_disk(&cache);
+        assert!(disk.entries.contains_key("common::curl"));
+        assert!(!disk.entries.contains_key("main::curl"));
 
         // No entry in the source scope: nothing carried, destination untouched.
         assert!(!cache.move_status("main", "common", "missing").unwrap());
