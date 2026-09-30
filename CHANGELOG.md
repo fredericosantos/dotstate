@@ -22,6 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Packages**: Moving a package between the profile and common lists now carries its cached install status to the new list and removes the stale entry from the old one. If nothing was cached, a status check starts instead of leaving the package `Unknown` (and skipped by install) until a manual check
 - **Packages**: Section headers in the Manage Packages list can no longer be selected (keyboard, scroll or click), and the selected package now stays selected across add/edit/delete/move instead of drifting to a different row or a header; a newly added or edited package is selected, and a deleted or moved one falls back to the nearest package
+- **Packages**: A manifest that already contains a name clash (written before the uniqueness rule existed, or hand-edited) can be edited again: an update that keeps the package's name and manager unchanged (e.g. description only) skips the uniqueness check. Renames and manager changes are still checked
+- **Packages**: Adding a package to (or renaming / changing the manager of a package in) a parent profile is now rejected when a descendant profile, direct or transitive, already defines the same name with a different manager ("already defined in descendant profile 'X' with a different manager"), since the child's resolved list would otherwise contain both. The same name and manager in a descendant remains a valid override
 
 ---
 

@@ -92,8 +92,16 @@ impl PackageService {
     /// `skip_index` is the index (within the target scope's own list) of the package being edited,
     /// so editing in place does not clash with itself.
     ///
-    /// Not checked (known gap): adding to a parent profile does not look at descendants that
-    /// already define the same name with a different manager.
+    /// Descendant check: for a `Profile(p)` target, any profile that inherits from `p` (directly or
+    /// transitively) and defines the same name with a DIFFERENT manager is rejected, because the
+    /// child's resolved list would then contain both entries. Same name + same manager in a
+    /// descendant is an intentional override and stays allowed.
+    ///
+    /// Unchanged edits: when `skip_index` points at a stored package whose name AND manager equal
+    /// the new ones, the rule is skipped. Such an edit (e.g. description only) cannot introduce a
+    /// clash, and enforcing the rule there would make manifests that already contain a clash
+    /// (written before the rule existed, or hand-edited) impossible to edit at all. A rename or a
+    /// manager change is always checked in full.
     pub fn check_name_available(
         manifest: &ProfileManifest,
         scope: PackageScope<'_>,
@@ -101,6 +109,20 @@ impl PackageService {
         manager: &PackageManager,
         skip_index: Option<usize>,
     ) -> Result<()> {
+        if let Some(index) = skip_index {
+            let stored = match scope {
+                PackageScope::Common => manifest.common.packages.get(index),
+                PackageScope::Profile(profile_name) => manifest
+                    .profiles
+                    .iter()
+                    .find(|p| p.name == profile_name)
+                    .and_then(|p| p.packages.get(index)),
+            };
+            if stored.is_some_and(|s| s.name == name && s.manager == *manager) {
+                return Ok(());
+            }
+        }
+
         let clash = |what: &str| {
             Err(anyhow::anyhow!(
                 "Package '{name}' is already defined {what}; package names must be unique across common and profile packages"
@@ -152,9 +174,47 @@ impl PackageService {
                         ));
                     }
                 }
+                for descendant in Self::descendants(manifest, profile_name) {
+                    let Some(profile) = manifest.profiles.iter().find(|p| p.name == descendant)
+                    else {
+                        continue;
+                    };
+                    if profile
+                        .packages
+                        .iter()
+                        .any(|p| p.name == name && p.manager != *manager)
+                    {
+                        return clash(&format!(
+                            "in descendant profile '{descendant}' with a different manager \
+                             (override it with the same manager, or pick another name)"
+                        ));
+                    }
+                }
             }
         }
         Ok(())
+    }
+
+    /// All profiles that inherit from `profile_name`, directly or transitively (breadth-first,
+    /// nearest first). Cycle-safe: each profile is visited at most once.
+    fn descendants(manifest: &ProfileManifest, profile_name: &str) -> Vec<String> {
+        let mut seen: Vec<String> = vec![profile_name.to_string()];
+        let mut queue = vec![profile_name.to_string()];
+        let mut out = Vec::new();
+        while !queue.is_empty() {
+            let mut next = Vec::new();
+            for parent in &queue {
+                for child in manifest.get_inheriting_profiles(parent) {
+                    if !seen.contains(&child) {
+                        seen.push(child.clone());
+                        out.push(child.clone());
+                        next.push(child);
+                    }
+                }
+            }
+            queue = next;
+        }
+        out
     }
 
     /// Convenience wrapper around [`Self::check_name_available`] that loads the manifest.
@@ -1123,5 +1183,210 @@ mod tests {
             make_test_package("git"),
         ));
         assert!(msg.contains("Profile 'ghost' not found"), "{msg}");
+    }
+
+    // ---- pre-existing clashes stay editable ----
+
+    /// Hand-build a manifest that already violates the rule (as if written before it existed).
+    fn repo_with_preexisting_clashes() -> TempDir {
+        let dir = repo_with_chain();
+        let mut manifest = ProfileManifest::load_or_backfill(dir.path()).unwrap();
+        manifest
+            .common
+            .packages
+            .push(make_pkg_with("git", PackageManager::Brew));
+        for (profile, pkg) in [
+            ("work", make_pkg_with("git", PackageManager::Apt)),
+            ("base", make_pkg_with("jq", PackageManager::Brew)),
+            ("laptop", make_pkg_with("jq", PackageManager::Apt)),
+        ] {
+            manifest
+                .profiles
+                .iter_mut()
+                .find(|p| p.name == profile)
+                .unwrap()
+                .packages
+                .push(pkg);
+        }
+        manifest.save(dir.path()).unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_description_only_edit_of_preexisting_clash_succeeds() {
+        let dir = repo_with_preexisting_clashes();
+        let repo = dir.path();
+
+        // Profile package clashing with common.
+        let mut edited = make_pkg_with("git", PackageManager::Apt);
+        edited.description = Some("edited".to_string());
+        let pkgs = PackageService::update_package(repo, "work", 0, edited).unwrap();
+        assert_eq!(pkgs[0].description.as_deref(), Some("edited"));
+
+        // Profile package clashing with an ancestor (different manager).
+        let mut edited = make_pkg_with("jq", PackageManager::Apt);
+        edited.description = Some("edited".to_string());
+        PackageService::update_package(repo, "laptop", 0, edited).unwrap();
+
+        // Common package clashing with profile packages.
+        let mut edited = make_pkg_with("git", PackageManager::Brew);
+        edited.description = Some("edited".to_string());
+        let pkgs = PackageService::update_common_package(repo, 0, edited).unwrap();
+        assert_eq!(pkgs[0].description.as_deref(), Some("edited"));
+    }
+
+    #[test]
+    fn test_rename_or_manager_change_of_preexisting_clash_still_checked() {
+        let dir = repo_with_preexisting_clashes();
+        let repo = dir.path();
+
+        // Renaming a package in `work` (index 0 = git/apt) into a common name fails...
+        PackageService::add_common_package(repo, make_test_package("curl")).unwrap();
+        let msg = err_text(PackageService::update_package(
+            repo,
+            "work",
+            0,
+            make_pkg_with("curl", PackageManager::Apt),
+        ));
+        assert!(msg.contains("already defined in common"), "{msg}");
+
+        // ...and so does renaming into an inherited name with a different manager.
+        let msg = err_text(PackageService::update_package(
+            repo,
+            "work",
+            0,
+            make_pkg_with("jq", PackageManager::Apt),
+        ));
+        assert!(msg.contains("inherited from 'base'"), "{msg}");
+
+        // A manager-only change of a clashing package is not an "unchanged" edit.
+        let msg = err_text(PackageService::update_package(
+            repo,
+            "work",
+            0,
+            make_pkg_with("git", PackageManager::Cargo),
+        ));
+        assert!(msg.contains("already defined in common"), "{msg}");
+
+        // Common: renaming into a profile package's name fails.
+        let msg = err_text(PackageService::update_common_package(
+            repo,
+            0,
+            make_pkg_with("jq", PackageManager::Brew),
+        ));
+        assert!(msg.contains("in profile 'base'"), "{msg}");
+    }
+
+    // ---- descendant check ----
+
+    #[test]
+    fn test_add_to_parent_rejected_when_descendant_has_different_manager() {
+        let dir = repo_with_chain();
+        let repo = dir.path();
+        PackageService::add_package(repo, "work", make_pkg_with("git", PackageManager::Apt))
+            .unwrap();
+        let msg = err_text(PackageService::add_package(
+            repo,
+            "base",
+            make_pkg_with("git", PackageManager::Brew),
+        ));
+        assert!(
+            msg.contains("already defined in descendant profile 'work' with a different manager"),
+            "{msg}"
+        );
+        assert!(PackageService::get_packages(repo, "base")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn test_add_to_ancestors_rejected_when_grandchild_has_different_manager() {
+        let dir = repo_with_chain();
+        let repo = dir.path();
+        PackageService::add_package(repo, "laptop", make_pkg_with("git", PackageManager::Apt))
+            .unwrap();
+        // Grandparent: the grandchild is a transitive descendant.
+        let msg = err_text(PackageService::add_package(
+            repo,
+            "base",
+            make_pkg_with("git", PackageManager::Brew),
+        ));
+        assert!(
+            msg.contains("already defined in descendant profile 'laptop' with a different manager"),
+            "{msg}"
+        );
+        // Parent: the grandchild is a direct descendant.
+        let msg = err_text(PackageService::add_package(
+            repo,
+            "work",
+            make_pkg_with("git", PackageManager::Brew),
+        ));
+        assert!(msg.contains("descendant profile 'laptop'"), "{msg}");
+    }
+
+    #[test]
+    fn test_add_to_parent_allowed_when_descendant_overrides_with_same_manager() {
+        let dir = repo_with_chain();
+        let repo = dir.path();
+        PackageService::add_package(repo, "laptop", make_pkg_with("git", PackageManager::Brew))
+            .unwrap();
+        PackageService::add_package(repo, "base", make_pkg_with("git", PackageManager::Brew))
+            .unwrap();
+        let manifest = ProfileManifest::load_or_backfill(repo).unwrap();
+        assert_eq!(manifest.resolve_packages("laptop").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_descendant_check_ignores_unrelated_profiles() {
+        let dir = repo_with_chain();
+        let repo = dir.path();
+        PackageService::add_package(repo, "other", make_pkg_with("git", PackageManager::Apt))
+            .unwrap();
+        PackageService::add_package(repo, "base", make_pkg_with("git", PackageManager::Brew))
+            .unwrap();
+    }
+
+    #[test]
+    fn test_update_parent_package_manager_change_rejected_by_descendant() {
+        let dir = repo_with_chain();
+        let repo = dir.path();
+        PackageService::add_package(repo, "base", make_pkg_with("git", PackageManager::Brew))
+            .unwrap();
+        PackageService::add_package(repo, "laptop", make_pkg_with("git", PackageManager::Brew))
+            .unwrap();
+        // Changing the parent's manager would leave the grandchild's override as a second entry.
+        let msg = err_text(PackageService::update_package(
+            repo,
+            "base",
+            0,
+            make_pkg_with("git", PackageManager::Apt),
+        ));
+        assert!(msg.contains("descendant profile 'laptop'"), "{msg}");
+        // A description-only edit is unaffected.
+        let mut edited = make_pkg_with("git", PackageManager::Brew);
+        edited.description = Some("d".to_string());
+        PackageService::update_package(repo, "base", 0, edited).unwrap();
+    }
+
+    #[test]
+    fn test_descendants_helper_is_transitive_and_cycle_safe() {
+        let dir = repo_with_chain();
+        let mut manifest = ProfileManifest::load_or_backfill(dir.path()).unwrap();
+        assert_eq!(
+            PackageService::descendants(&manifest, "base"),
+            ["work", "laptop"]
+        );
+        assert!(PackageService::descendants(&manifest, "laptop").is_empty());
+        // A hand-edited cycle must terminate.
+        manifest
+            .profiles
+            .iter_mut()
+            .find(|p| p.name == "base")
+            .unwrap()
+            .inherits = Some("laptop".to_string());
+        assert_eq!(
+            PackageService::descendants(&manifest, "base"),
+            ["work", "laptop"]
+        );
     }
 }
