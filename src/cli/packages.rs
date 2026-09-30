@@ -16,6 +16,7 @@ use crate::services::{PackageCheckStatus, PackageCreationParams, PackageService}
 use crate::utils::profile_manifest::Package;
 use anyhow::Result;
 use clap::Subcommand;
+use tracing::warn;
 
 #[derive(Subcommand, Debug)]
 pub enum PackagesCommand {
@@ -308,7 +309,14 @@ fn print_package_list(packages: &[Package], verbose: bool, check_status: bool, c
             };
 
             if let Some(is_installed) = installed {
-                let _ = cache.update_status(cache_scope, &package.name, is_installed, None, None);
+                if let Err(e) =
+                    cache.update_status(cache_scope, &package.name, is_installed, None, None)
+                {
+                    warn!(
+                        "Failed to update package cache for '{}': {}",
+                        package.name, e
+                    );
+                }
             }
 
             Some(status)
@@ -806,7 +814,14 @@ fn check_and_print_packages(packages: &[Package], cache_scope: &str) {
         };
 
         if let Some(installed_status) = is_installed {
-            let _ = cache.update_status(cache_scope, &package.name, installed_status, None, None);
+            if let Err(e) =
+                cache.update_status(cache_scope, &package.name, installed_status, None, None)
+            {
+                warn!(
+                    "Failed to update package cache for '{}': {}",
+                    package.name, e
+                );
+            }
         }
 
         println!("  {:<12} {:<8} {}", package.name, manager_str, status_str);

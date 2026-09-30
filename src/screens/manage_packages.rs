@@ -524,13 +524,15 @@ impl ManagePackagesScreen {
                                                 state.common_package_statuses[*package_index] =
                                                     PackageStatus::Installed;
                                             }
-                                            let _ = state.cache.update_status(
+                                            if let Err(e) = state.cache.update_status(
                                                 "common",
                                                 package_name,
                                                 true,
                                                 None,
                                                 Some("Successfully installed".to_string()),
-                                            );
+                                            ) {
+                                                warn!("Failed to update package cache: {}", e);
+                                            }
                                         } else {
                                             if *package_index < state.package_statuses.len() {
                                                 state.package_statuses[*package_index] =
