@@ -422,6 +422,112 @@ impl PackageService {
             .unwrap_or_default())
     }
 
+    /// Get common packages shared across all profiles.
+    pub fn get_common_packages(repo_path: &Path) -> Result<Vec<Package>> {
+        let manifest = ProfileManifest::load_or_backfill(repo_path)?;
+        Ok(manifest.common.packages)
+    }
+
+    /// Add a package to the common section.
+    ///
+    /// Returns the updated list of common packages.
+    pub fn add_common_package(repo_path: &Path, package: Package) -> Result<Vec<Package>> {
+        info!("Adding common package: {}", package.name);
+        let mut manifest = ProfileManifest::load_or_backfill(repo_path)?;
+        manifest.add_common_package(package);
+        let packages = manifest.common.packages.clone();
+        manifest.save(repo_path)?;
+        Ok(packages)
+    }
+
+    /// Update a common package by index.
+    ///
+    /// Returns the updated list of common packages.
+    pub fn update_common_package(
+        repo_path: &Path,
+        index: usize,
+        package: Package,
+    ) -> Result<Vec<Package>> {
+        let mut manifest = ProfileManifest::load_or_backfill(repo_path)?;
+        if index < manifest.common.packages.len() {
+            let old_name = manifest.common.packages[index].name.clone();
+            info!("Updating common package: {} -> {}", old_name, package.name);
+            manifest.common.packages[index] = package;
+            let packages = manifest.common.packages.clone();
+            manifest.save(repo_path)?;
+            Ok(packages)
+        } else {
+            Err(anyhow::anyhow!(
+                "Common package index {} out of bounds ({} packages)",
+                index,
+                manifest.common.packages.len()
+            ))
+        }
+    }
+
+    /// Delete a common package by index.
+    ///
+    /// Returns the updated list of common packages.
+    pub fn delete_common_package(repo_path: &Path, index: usize) -> Result<Vec<Package>> {
+        let mut manifest = ProfileManifest::load_or_backfill(repo_path)?;
+        if index < manifest.common.packages.len() {
+            let name = manifest.common.packages[index].name.clone();
+            info!("Deleting common package: {} (index: {})", name, index);
+            manifest.common.packages.remove(index);
+            let packages = manifest.common.packages.clone();
+            manifest.save(repo_path)?;
+            Ok(packages)
+        } else {
+            Err(anyhow::anyhow!(
+                "Common package index {} out of bounds ({} packages)",
+                index,
+                manifest.common.packages.len()
+            ))
+        }
+    }
+
+    /// Move a package from a profile to the common section.
+    ///
+    /// Returns `(common_packages, profile_packages)` after the move.
+    pub fn move_package_to_common(
+        repo_path: &Path,
+        profile: &str,
+        index: usize,
+    ) -> Result<(Vec<Package>, Vec<Package>)> {
+        let mut manifest = ProfileManifest::load_or_backfill(repo_path)?;
+        manifest.move_package_to_common(profile, index)?;
+        manifest.save(repo_path)?;
+        let common = manifest.common.packages.clone();
+        let profile_pkgs = manifest
+            .profiles
+            .iter()
+            .find(|p| p.name == profile)
+            .map(|p| p.packages.clone())
+            .unwrap_or_default();
+        Ok((common, profile_pkgs))
+    }
+
+    /// Move a package from the common section to a profile.
+    ///
+    /// Returns `(common_packages, profile_packages)` after the move.
+    pub fn move_package_from_common(
+        repo_path: &Path,
+        profile: &str,
+        index: usize,
+    ) -> Result<(Vec<Package>, Vec<Package>)> {
+        let mut manifest = ProfileManifest::load_or_backfill(repo_path)?;
+        manifest.move_package_from_common_by_index(profile, index)?;
+        manifest.save(repo_path)?;
+        let common = manifest.common.packages.clone();
+        let profile_pkgs = manifest
+            .profiles
+            .iter()
+            .find(|p| p.name == profile)
+            .map(|p| p.packages.clone())
+            .unwrap_or_default();
+        Ok((common, profile_pkgs))
+    }
+
     /// Get the install command builder for a package.
     ///
     /// # Arguments
@@ -459,6 +565,7 @@ impl PackageService {
 mod tests {
     use super::PackageCreationParams;
     use super::*;
+    use tempfile::TempDir;
 
     #[test]
     fn test_validate_package_empty_name() {
@@ -548,5 +655,66 @@ mod tests {
         assert_eq!(package.binary_name, "git");
         assert_eq!(package.package_name, Some("git".to_string()));
         assert!(package.install_command.is_none());
+    }
+
+    fn make_test_package(name: &str) -> Package {
+        Package {
+            name: name.to_string(),
+            description: None,
+            manager: PackageManager::Brew,
+            package_name: Some(name.to_string()),
+            binary_name: name.to_string(),
+            install_command: None,
+            existence_check: None,
+            manager_check: None,
+        }
+    }
+
+    #[test]
+    fn test_add_common_package_to_manifest() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_path = temp_dir.path();
+
+        let packages =
+            PackageService::add_common_package(repo_path, make_test_package("git")).unwrap();
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].name, "git");
+
+        // Verify persisted to disk
+        let reloaded = PackageService::get_common_packages(repo_path).unwrap();
+        assert_eq!(reloaded.len(), 1);
+    }
+
+    #[test]
+    fn test_delete_common_package() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_path = temp_dir.path();
+
+        PackageService::add_common_package(repo_path, make_test_package("git")).unwrap();
+        let packages = PackageService::delete_common_package(repo_path, 0).unwrap();
+        assert!(packages.is_empty());
+    }
+
+    #[test]
+    fn test_update_common_package() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_path = temp_dir.path();
+
+        PackageService::add_common_package(repo_path, make_test_package("git")).unwrap();
+        let mut updated = make_test_package("git");
+        updated.description = Some("Version control".to_string());
+        let packages = PackageService::update_common_package(repo_path, 0, updated).unwrap();
+        assert_eq!(packages[0].description, Some("Version control".to_string()));
+    }
+
+    #[test]
+    fn test_duplicate_common_package_not_added() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_path = temp_dir.path();
+
+        PackageService::add_common_package(repo_path, make_test_package("git")).unwrap();
+        let packages =
+            PackageService::add_common_package(repo_path, make_test_package("git")).unwrap();
+        assert_eq!(packages.len(), 1, "Duplicate should not be added");
     }
 }

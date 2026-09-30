@@ -201,11 +201,14 @@ pub struct ProfileSelectionState {
 pub struct PackageManagerState {
     pub list_state: ListState,
     pub packages: Vec<crate::utils::profile_manifest::Package>, // From active profile
+    pub common_packages: Vec<crate::utils::profile_manifest::Package>, // Shared across all profiles
     pub popup_type: PackagePopupType,
     // Checking state
     pub is_checking: bool,
     pub checking_index: Option<usize>,
+    pub checking_is_common: bool, // Whether checking_index refers to common_packages
     pub package_statuses: Vec<PackageStatus>, // Installed/NotInstalled/Error
+    pub common_package_statuses: Vec<PackageStatus>, // Statuses for common packages
     pub checking_delay_until: Option<std::time::Instant>, // Delay between checks for UI responsiveness
     // Installation state
     pub installation_step: InstallationStep,
@@ -226,6 +229,7 @@ pub struct PackageManagerState {
     pub add_focused_field: AddPackageField,
     pub add_editing_index: Option<usize>, // None for add, Some(index) for edit
     pub add_validation_error: Option<String>, // Validation error to display in popup
+    pub is_adding_common: bool,           // True = Add/Edit popup targets common section
     pub newly_added_index: Option<usize>, // Track newly added package to prompt install after check
     pub available_managers: Vec<crate::utils::profile_manifest::PackageManager>, // OS-filtered list
     pub manager_list_state: ListState,    // For manager selection
@@ -302,10 +306,13 @@ impl Default for PackageManagerState {
         Self {
             list_state: ListState::default(),
             packages: Vec::new(),
+            common_packages: Vec::new(),
             popup_type: PackagePopupType::None,
             is_checking: false,
             checking_index: None,
+            checking_is_common: true,
             package_statuses: Vec::new(),
+            common_package_statuses: Vec::new(),
             add_name_input: crate::utils::TextInput::new(),
             add_description_input: crate::utils::TextInput::new(),
             add_manager: None,
@@ -319,6 +326,7 @@ impl Default for PackageManagerState {
             add_focused_field: AddPackageField::Name,
             add_editing_index: None,
             add_validation_error: None,
+            is_adding_common: false,
             newly_added_index: None,
             available_managers: Vec::new(),
             manager_list_state: ListState::default(),
@@ -379,11 +387,12 @@ pub enum InstallationStep {
     NotStarted,
     Installing {
         package_index: usize,
+        package_is_common: bool, // Whether package_index refers to common_packages
         package_name: String,
         total_packages: usize,
-        packages_to_install: Vec<usize>, // Indices of packages that need installation
-        installed: Vec<usize>,           // Successfully installed package indices
-        failed: Vec<(usize, String)>,    // Failed package indices with error messages
+        packages_to_install: Vec<(usize, bool)>, // (index, is_common) of packages to install
+        installed: Vec<usize>,                   // Count of successfully installed packages
+        failed: Vec<(usize, String)>,            // (flat_index, error) of failed packages
         status_rx: Option<std::sync::mpsc::Receiver<InstallationStatus>>, // Channel receiver for status updates
     },
     Complete {
