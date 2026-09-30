@@ -13,15 +13,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Keymap**: Emacs `CreateCommon` is `Shift+O` instead of `Ctrl+Shift+O`, which plain terminals deliver as `Ctrl+O` (the Create binding) and so was unreachable; added a test that Manage Packages actions never share a key within a preset
 - **CLI `--common` flag**: All `dotstate packages` subcommands (`list`, `add`, `remove`, `check`, `install`) accept `--common` to operate on the shared package list instead of a profile
 
-### Fixed
-
-- **Packages**: Moving a package between the profile and common lists now carries its cached install status to the new list and removes the stale entry from the old one. If nothing was cached, a status check starts instead of leaving the package `Unknown` (and skipped by install) until a manual check
-
 ### Changed
 
 - **Manifest**: Schema version bumped 2 -> 3 (`[common] packages`), with a no-op v2 -> v3 migration that backs up the file first. Builds now refuse to load or overwrite a manifest with a version newer than they support, instead of silently dropping unknown fields on save. Note: builds that predate this guard (including upstream v0.4.1) do not check for newer versions and will still drop `[common] packages` if they save a v3 manifest
-
 - **Packages**: Package names must now be unique across common, the target profile and its inherited profiles, enforced in the service layer for add and update (CLI and TUI). A clash returns an error naming the scope ("in common", "in profile 'X'", "inherited from 'Y'") and the CLI exits non-zero. A child profile may still override an inherited package with the same name and manager; the same name with a different manager is rejected
+
+### Fixed
+
+- **Packages**: Moving a package between the profile and common lists now carries its cached install status to the new list and removes the stale entry from the old one. If nothing was cached, a status check starts instead of leaving the package `Unknown` (and skipped by install) until a manual check
+- **Packages**: Section headers in the Manage Packages list can no longer be selected (keyboard, scroll or click), and the selected package now stays selected across add/edit/delete/move instead of drifting to a different row or a header; a newly added or edited package is selected, and a deleted or moved one falls back to the nearest package
 
 ---
 

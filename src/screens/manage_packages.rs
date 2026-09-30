@@ -31,6 +31,15 @@ enum DisplayItem {
     PackageProfile(usize), // index into state.packages
 }
 
+/// Identity of the selected package, kept across list rebuilds.
+#[derive(Debug)]
+struct RememberedSelection {
+    is_common: bool,
+    /// Index within its own section, used as the fallback position if the package is gone.
+    index: usize,
+    name: String,
+}
+
 /// Resolved selection from the flat display list.
 #[derive(Debug)]
 enum SelectedPackageItem {
@@ -84,6 +93,7 @@ impl ManagePackagesScreen {
     }
 
     pub fn update_packages(&mut self, packages: Vec<Package>, active_profile: &str) {
+        let previous = self.remember_selection();
         self.state.packages = packages;
         self.state.active_profile = active_profile.to_string();
 
@@ -101,6 +111,7 @@ impl ManagePackagesScreen {
             }
         }
         self.state.package_statuses = statuses;
+        self.restore_selection(previous);
     }
 
     /// Update both common and profile packages at once.
@@ -110,6 +121,7 @@ impl ManagePackagesScreen {
         profile_packages: Vec<Package>,
         active_profile: &str,
     ) {
+        let previous = self.remember_selection();
         self.state.active_profile = active_profile.to_string();
 
         // Initialize common package statuses from cache (profile_name = "common")
@@ -143,6 +155,114 @@ impl ManagePackagesScreen {
         }
         self.state.packages = profile_packages;
         self.state.package_statuses = profile_statuses;
+        self.restore_selection(previous);
+    }
+
+    /// Identify the selected package (scope, index within scope, name) so the selection can be
+    /// restored after the lists are replaced. `None` when nothing or a header is selected.
+    fn remember_selection(&self) -> Option<RememberedSelection> {
+        let (is_common, index, list) = match self.get_selected_item() {
+            SelectedPackageItem::Common(i) => (true, i, &self.state.common_packages),
+            SelectedPackageItem::Profile(i) => (false, i, &self.state.packages),
+            SelectedPackageItem::Header | SelectedPackageItem::None => return None,
+        };
+        list.get(index).map(|p| RememberedSelection {
+            is_common,
+            index,
+            name: p.name.clone(),
+        })
+    }
+
+    /// Reselect a remembered package by identity (scope + name) after the lists were rebuilt.
+    /// If it is gone (deleted or moved), select the nearest package: the same position clamped
+    /// within the same section, else the closest package in the other section. With no
+    /// remembered selection, select the first package. With no packages at all, select nothing.
+    fn restore_selection(&mut self, previous: Option<RememberedSelection>) {
+        let target = previous.and_then(|prev| {
+            let (same, other) = if prev.is_common {
+                (&self.state.common_packages, &self.state.packages)
+            } else {
+                (&self.state.packages, &self.state.common_packages)
+            };
+            if let Some(i) = same.iter().position(|p| p.name == prev.name) {
+                Some((prev.is_common, i))
+            } else if !same.is_empty() {
+                Some((prev.is_common, prev.index.min(same.len() - 1)))
+            } else if other.is_empty() {
+                None
+            } else if prev.is_common {
+                // Common section vanished; its neighbour below is the first profile package.
+                Some((false, 0))
+            } else {
+                // Profile section vanished; its neighbour above is the last common package.
+                Some((true, other.len() - 1))
+            }
+        });
+        match target {
+            Some((is_common, i)) => self.select_package_index(is_common, i),
+            None => self.select_first_package(),
+        }
+    }
+
+    /// Select the first package row, or nothing if there are no packages.
+    fn select_first_package(&mut self) {
+        let first = self
+            .build_display_items()
+            .iter()
+            .position(|item| !matches!(item, DisplayItem::Header(_)));
+        self.state.list_state.select(first);
+    }
+
+    /// Select a package by scope and index within that scope.
+    fn select_package_index(&mut self, is_common: bool, index: usize) {
+        let row = self
+            .build_display_items()
+            .iter()
+            .position(|item| match item {
+                DisplayItem::PackageCommon(i) => is_common && *i == index,
+                DisplayItem::PackageProfile(i) => !is_common && *i == index,
+                DisplayItem::Header(_) => false,
+            });
+        self.state.list_state.select(row);
+    }
+
+    /// Select a package by scope and name (used to select a just-added or just-edited package).
+    fn select_package_by_name(&mut self, is_common: bool, name: &str) {
+        let list = if is_common {
+            &self.state.common_packages
+        } else {
+            &self.state.packages
+        };
+        if let Some(i) = list.iter().position(|p| p.name == name) {
+            self.select_package_index(is_common, i);
+        }
+    }
+
+    /// Move the selection by `delta` package rows, skipping section headers. Does not wrap:
+    /// it stops at the first/last package, matching `ListState::select_next/previous`.
+    fn move_selection(&mut self, delta: isize) {
+        let rows: Vec<usize> = self
+            .build_display_items()
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| !matches!(item, DisplayItem::Header(_)))
+            .map(|(row, _)| row)
+            .collect();
+        if rows.is_empty() {
+            self.state.list_state.select(None);
+            return;
+        }
+        let pos = self
+            .state
+            .list_state
+            .selected()
+            .and_then(|row| rows.iter().position(|&r| r == row));
+        let new_pos = match pos {
+            Some(p) => p.saturating_add_signed(delta).min(rows.len() - 1),
+            None if delta < 0 => rows.len() - 1,
+            None => 0,
+        };
+        self.state.list_state.select(Some(rows[new_pos]));
     }
 
     /// Build the flat display list combining common and profile packages with section headers.
@@ -677,13 +797,7 @@ impl Screen for ManagePackagesScreen {
         let has_packages =
             !self.state.packages.is_empty() || !self.state.common_packages.is_empty();
         if has_packages && self.state.list_state.selected().is_none() {
-            let display_items = self.build_display_items();
-            let first_pkg = display_items
-                .iter()
-                .position(|item| !matches!(item, DisplayItem::Header(_)));
-            if let Some(idx) = first_pkg {
-                self.state.list_state.select(Some(idx));
-            }
+            self.select_first_package();
         }
 
         // Always render main content first (so dialogs can dim it)
@@ -844,7 +958,12 @@ impl ManagePackagesScreen {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(&idx) = self.mouse_regions.hit_test(mouse.column, mouse.row) {
-                    if !self.state.is_checking {
+                    // Clicks on section headers are ignored (selection unchanged).
+                    let is_package = !matches!(
+                        self.build_display_items().get(idx),
+                        Some(DisplayItem::Header(_)) | None
+                    );
+                    if is_package && !self.state.is_checking {
                         self.state.list_state.select(Some(idx));
                         return Ok(ScreenAction::Refresh);
                     }
@@ -854,9 +973,7 @@ impl ManagePackagesScreen {
                 if let Some(area) = self.list_pane_area {
                     let pos = ratatui::layout::Position::new(mouse.column, mouse.row);
                     if area.contains(pos) && !self.state.is_checking {
-                        for _ in 0..3 {
-                            self.state.list_state.select_next();
-                        }
+                        self.move_selection(3);
                         return Ok(ScreenAction::Refresh);
                     }
                 }
@@ -865,9 +982,7 @@ impl ManagePackagesScreen {
                 if let Some(area) = self.list_pane_area {
                     let pos = ratatui::layout::Position::new(mouse.column, mouse.row);
                     if area.contains(pos) && !self.state.is_checking {
-                        for _ in 0..3 {
-                            self.state.list_state.select_previous();
-                        }
+                        self.move_selection(-3);
                         return Ok(ScreenAction::Refresh);
                     }
                 }
@@ -983,16 +1098,20 @@ impl ManagePackagesScreen {
         // Resolve which package (if any) is currently selected
         let selected_item = self.get_selected_item();
 
+        match action {
+            Action::MoveUp if !self.state.is_checking => {
+                self.move_selection(-1);
+                return Ok(ScreenAction::Refresh);
+            }
+            Action::MoveDown if !self.state.is_checking => {
+                self.move_selection(1);
+                return Ok(ScreenAction::Refresh);
+            }
+            _ => {}
+        }
+
         let state = &mut self.state;
         match action {
-            Action::MoveUp if !state.is_checking => {
-                state.list_state.select_previous();
-                return Ok(ScreenAction::Refresh);
-            }
-            Action::MoveDown if !state.is_checking => {
-                state.list_state.select_next();
-                return Ok(ScreenAction::Refresh);
-            }
             Action::Refresh
                 if state.popup_type == PackagePopupType::None
                     && !state.is_checking
@@ -1645,6 +1764,7 @@ impl ManagePackagesScreen {
                                 profile_packages,
                                 &active_profile,
                             );
+                            self.select_package_by_name(true, &new_name);
                             if let Some(idx) = new_pkg_idx {
                                 if idx < self.state.common_package_statuses.len() {
                                     self.state.common_package_statuses[idx] =
@@ -1670,6 +1790,7 @@ impl ManagePackagesScreen {
                             };
                             let common_packages = self.state.common_packages.clone();
                             self.update_all_packages(common_packages, packages, &active_profile);
+                            self.select_package_by_name(false, &new_name);
                             if let Some(idx) = new_pkg_idx {
                                 if idx < self.state.package_statuses.len() {
                                     self.state.package_statuses[idx] = PackageStatus::Unknown;
@@ -3628,6 +3749,205 @@ mod tests {
             existence_check: Some(existence_check.to_string()),
             manager_check: None,
         }
+    }
+
+    fn screen_with(common: &[&str], profile: &[&str]) -> (ManagePackagesScreen, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut screen = ManagePackagesScreen::new();
+        screen.state.cache = PackageCache::with_path(tmp.path().join("package_status.json"));
+        screen.update_all_packages(
+            common.iter().map(|n| custom_package(n, "true")).collect(),
+            profile.iter().map(|n| custom_package(n, "true")).collect(),
+            "main",
+        );
+        (screen, tmp)
+    }
+
+    /// Name and scope of the selected package; panics if a header or nothing is selected.
+    fn selected(screen: &ManagePackagesScreen) -> (bool, String) {
+        match screen.get_selected_item() {
+            SelectedPackageItem::Common(i) => (true, screen.state.common_packages[i].name.clone()),
+            SelectedPackageItem::Profile(i) => (false, screen.state.packages[i].name.clone()),
+            other => panic!("expected a package to be selected, got {other:?}"),
+        }
+    }
+
+    fn sel(is_common: bool, name: &str) -> (bool, String) {
+        (is_common, name.to_string())
+    }
+
+    #[test]
+    fn initial_selection_is_first_package_not_header() {
+        let (screen, _tmp) = screen_with(&["c0"], &["p0"]);
+        assert_eq!(screen.state.list_state.selected(), Some(1));
+        assert_eq!(selected(&screen), sel(true, "c0"));
+
+        let (screen, _tmp) = screen_with(&[], &["p0", "p1"]);
+        assert_eq!(screen.state.list_state.selected(), Some(1));
+        assert_eq!(selected(&screen), sel(false, "p0"));
+    }
+
+    #[test]
+    fn empty_lists_select_nothing() {
+        let (mut screen, _tmp) = screen_with(&[], &[]);
+        assert_eq!(screen.state.list_state.selected(), None);
+        screen.move_selection(1);
+        assert_eq!(screen.state.list_state.selected(), None);
+        screen.move_selection(-1);
+        assert_eq!(screen.state.list_state.selected(), None);
+
+        // Deleting the last package leaves nothing selected.
+        let (mut screen, _tmp) = screen_with(&[], &["p0"]);
+        screen.update_all_packages(Vec::new(), Vec::new(), "main");
+        assert_eq!(screen.state.list_state.selected(), None);
+        assert!(matches!(
+            screen.get_selected_item(),
+            SelectedPackageItem::None
+        ));
+    }
+
+    #[test]
+    fn navigation_skips_headers_in_both_directions() {
+        // Rows: [Hc, c0, c1, Hp, p0, p1]
+        let (mut screen, _tmp) = screen_with(&["c0", "c1"], &["p0", "p1"]);
+        assert_eq!(selected(&screen), sel(true, "c0"));
+
+        let mut seen = vec![selected(&screen)];
+        for _ in 0..3 {
+            screen.move_selection(1);
+            seen.push(selected(&screen));
+        }
+        assert_eq!(
+            seen,
+            [
+                sel(true, "c0"),
+                sel(true, "c1"),
+                sel(false, "p0"),
+                sel(false, "p1")
+            ]
+        );
+        // No wrap: stays on the last package.
+        screen.move_selection(1);
+        assert_eq!(selected(&screen), sel(false, "p1"));
+
+        for expected in [sel(false, "p0"), sel(true, "c1"), sel(true, "c0")] {
+            screen.move_selection(-1);
+            assert_eq!(selected(&screen), expected);
+        }
+        screen.move_selection(-1);
+        assert_eq!(selected(&screen), sel(true, "c0"));
+
+        // Multi-step (mouse scroll) jumps also never land on a header.
+        screen.move_selection(2);
+        assert_eq!(selected(&screen), sel(false, "p0"));
+        screen.move_selection(-2);
+        assert_eq!(selected(&screen), sel(true, "c0"));
+        screen.move_selection(3);
+        assert_eq!(selected(&screen), sel(false, "p1"));
+        screen.move_selection(-3);
+        assert_eq!(selected(&screen), sel(true, "c0"));
+    }
+
+    #[test]
+    fn selection_survives_add_to_other_section() {
+        let (mut screen, _tmp) = screen_with(&[], &["p0", "p1"]);
+        screen.move_selection(1);
+        assert_eq!(selected(&screen), sel(false, "p1"));
+        assert_eq!(screen.state.list_state.selected(), Some(2));
+
+        // Rows become [Hc, c0, Hp, p0, p1]: stale flat index 2 would be the header.
+        screen.update_all_packages(
+            vec![custom_package("c0", "true")],
+            vec![custom_package("p0", "true"), custom_package("p1", "true")],
+            "main",
+        );
+        assert_eq!(selected(&screen), sel(false, "p1"));
+        assert_eq!(screen.state.list_state.selected(), Some(4));
+    }
+
+    #[test]
+    fn select_package_by_name_selects_new_package() {
+        let (mut screen, _tmp) = screen_with(&["c0"], &["p0"]);
+        screen.update_all_packages(
+            vec![custom_package("c0", "true"), custom_package("c1", "true")],
+            vec![custom_package("p0", "true")],
+            "main",
+        );
+        screen.select_package_by_name(true, "c1");
+        assert_eq!(selected(&screen), sel(true, "c1"));
+    }
+
+    #[test]
+    fn selection_after_deleting_selected_item_is_nearest() {
+        // Delete the middle of three: same position now holds the next package.
+        let (mut screen, _tmp) = screen_with(&[], &["p0", "p1", "p2"]);
+        screen.move_selection(1);
+        screen.update_all_packages(
+            Vec::new(),
+            vec![custom_package("p0", "true"), custom_package("p2", "true")],
+            "main",
+        );
+        assert_eq!(selected(&screen), sel(false, "p2"));
+
+        // Delete the last: clamps to the new last.
+        screen.update_all_packages(Vec::new(), vec![custom_package("p0", "true")], "main");
+        assert_eq!(selected(&screen), sel(false, "p0"));
+
+        // Delete the last of the common section: stays in common rather than jumping below.
+        let (mut screen, _tmp) = screen_with(&["c0", "c1"], &["p0"]);
+        screen.move_selection(1);
+        assert_eq!(selected(&screen), sel(true, "c1"));
+        screen.update_all_packages(
+            vec![custom_package("c0", "true")],
+            vec![custom_package("p0", "true")],
+            "main",
+        );
+        assert_eq!(selected(&screen), sel(true, "c0"));
+
+        // Delete the only profile package: falls back to the last common package.
+        let (mut screen, _tmp) = screen_with(&["c0", "c1"], &["p0"]);
+        screen.move_selection(1);
+        screen.move_selection(1);
+        assert_eq!(selected(&screen), sel(false, "p0"));
+        screen.update_all_packages(
+            vec![custom_package("c0", "true"), custom_package("c1", "true")],
+            Vec::new(),
+            "main",
+        );
+        assert_eq!(selected(&screen), sel(true, "c1"));
+    }
+
+    #[test]
+    fn moving_only_common_package_selects_a_package_not_a_header() {
+        let (mut screen, _tmp) = screen_with(&["c0"], &["p0", "p1"]);
+        assert_eq!(selected(&screen), sel(true, "c0"));
+
+        // c0 moves to the profile; the common header disappears, rows: [Hp, c0, p0, p1].
+        screen.update_all_packages(
+            Vec::new(),
+            vec![
+                custom_package("c0", "true"),
+                custom_package("p0", "true"),
+                custom_package("p1", "true"),
+            ],
+            "main",
+        );
+        assert_eq!(selected(&screen), sel(false, "c0"));
+
+        // Previously selected profile package keeps its identity when the common header goes away.
+        let (mut screen, _tmp) = screen_with(&["c0"], &["p0", "p1"]);
+        screen.move_selection(2);
+        assert_eq!(selected(&screen), sel(false, "p1"));
+        screen.update_all_packages(
+            Vec::new(),
+            vec![
+                custom_package("c0", "true"),
+                custom_package("p0", "true"),
+                custom_package("p1", "true"),
+            ],
+            "main",
+        );
+        assert_eq!(selected(&screen), sel(false, "p1"));
     }
 
     /// A newly added *common* package must be checked even after `reset_state()` cleared
