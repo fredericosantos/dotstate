@@ -21,6 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Manifest**: Schema version bumped 2 -> 3 (`[common] packages`), with a no-op v2 -> v3 migration that backs up the file first. Builds now refuse to load or overwrite a manifest with a version newer than they support, instead of silently dropping unknown fields on save. Note: builds that predate this guard (including upstream v0.4.1) do not check for newer versions and will still drop `[common] packages` if they save a v3 manifest
 
+- **Packages**: Package names must now be unique across common, the target profile and its inherited profiles, enforced in the service layer for add and update (CLI and TUI). A clash returns an error naming the scope ("in common", "in profile 'X'", "inherited from 'Y'") and the CLI exits non-zero. A child profile may still override an inherited package with the same name and manager; the same name with a different manager is rejected
+
 ---
 
 ## [0.4.1] - 2026-09-22
