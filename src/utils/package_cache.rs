@@ -178,6 +178,31 @@ impl PackageCache {
         Ok(())
     }
 
+    /// Move a package's cached status from one scope to another (e.g. profile -> "common").
+    ///
+    /// The new entry keeps the old installed flag, check command and output; the old entry is
+    /// removed. Returns `true` if an old entry existed and was carried over, `false` if there
+    /// was nothing to carry (the package is then `Unknown` in its new scope).
+    pub fn move_status(
+        &mut self,
+        from_scope: &str,
+        to_scope: &str,
+        package_name: &str,
+    ) -> Result<bool> {
+        let Some(old) = self.get_status(from_scope, package_name).cloned() else {
+            return Ok(false);
+        };
+        self.update_status(
+            to_scope,
+            package_name,
+            old.installed,
+            old.check_command,
+            old.output,
+        )?;
+        self.remove_status(from_scope, package_name)?;
+        Ok(true)
+    }
+
     /// Save package cache to file.
     /// Uses atomic write (temp file + rename) to prevent corruption on crash.
     fn save(&self) -> Result<()> {
@@ -199,5 +224,36 @@ impl PackageCache {
 
         debug!("Package cache saved to {:?}", self.cache_file);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn move_status_carries_entry_and_removes_old_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut cache = PackageCache::with_path(tmp.path().join("package_status.json"));
+        cache
+            .update_status(
+                "main",
+                "curl",
+                true,
+                Some("which curl".to_string()),
+                Some("/usr/bin/curl".to_string()),
+            )
+            .unwrap();
+
+        assert!(cache.move_status("main", "common", "curl").unwrap());
+        assert!(cache.get_status("main", "curl").is_none());
+        let moved = cache.get_status("common", "curl").unwrap();
+        assert!(moved.installed);
+        assert_eq!(moved.check_command.as_deref(), Some("which curl"));
+        assert_eq!(moved.output.as_deref(), Some("/usr/bin/curl"));
+
+        // No entry in the source scope: nothing carried, destination untouched.
+        assert!(!cache.move_status("main", "common", "missing").unwrap());
+        assert!(cache.get_status("common", "missing").is_none());
     }
 }

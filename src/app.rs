@@ -1021,17 +1021,42 @@ impl App {
                     .start_installing_missing_packages();
             }
             ScreenAction::MovePackageToCommon { index } => {
+                let moved_name = self
+                    .manage_packages_screen
+                    .state
+                    .packages
+                    .get(index)
+                    .map(|p| p.name.clone());
                 match crate::services::PackageService::move_package_to_common(
                     &self.config.repo_path,
                     &self.config.active_profile,
                     index,
                 ) {
                     Ok((common_packages, profile_packages)) => {
+                        // Carry the cached status to the new scope (dropping the stale old
+                        // entry) before the screen rebuilds its statuses from the cache.
+                        // With nothing cached the package is Unknown, so start a check.
+                        let carried = moved_name.is_some_and(|name| {
+                            match self.manage_packages_screen.state.cache.move_status(
+                                &self.config.active_profile,
+                                "common",
+                                &name,
+                            ) {
+                                Ok(carried) => carried,
+                                Err(e) => {
+                                    warn!("Failed to move package cache entry: {}", e);
+                                    false
+                                }
+                            }
+                        });
                         self.manage_packages_screen.update_all_packages(
                             common_packages,
                             profile_packages,
                             &self.config.active_profile,
                         );
+                        if !carried {
+                            self.manage_packages_screen.start_checking();
+                        }
                         self.toast_manager.push(crate::widgets::Toast::new(
                             "Package moved to common".to_string(),
                             crate::widgets::ToastVariant::Success,
@@ -1046,17 +1071,42 @@ impl App {
                 }
             }
             ScreenAction::MovePackageFromCommon { index } => {
+                let moved_name = self
+                    .manage_packages_screen
+                    .state
+                    .common_packages
+                    .get(index)
+                    .map(|p| p.name.clone());
                 match crate::services::PackageService::move_package_from_common(
                     &self.config.repo_path,
                     &self.config.active_profile,
                     index,
                 ) {
                     Ok((common_packages, profile_packages)) => {
+                        // Carry the cached status to the new scope (dropping the stale old
+                        // entry) before the screen rebuilds its statuses from the cache.
+                        // With nothing cached the package is Unknown, so start a check.
+                        let carried = moved_name.is_some_and(|name| {
+                            match self.manage_packages_screen.state.cache.move_status(
+                                "common",
+                                &self.config.active_profile,
+                                &name,
+                            ) {
+                                Ok(carried) => carried,
+                                Err(e) => {
+                                    warn!("Failed to move package cache entry: {}", e);
+                                    false
+                                }
+                            }
+                        });
                         self.manage_packages_screen.update_all_packages(
                             common_packages,
                             profile_packages,
                             &self.config.active_profile,
                         );
+                        if !carried {
+                            self.manage_packages_screen.start_checking();
+                        }
                         self.toast_manager.push(crate::widgets::Toast::new(
                             "Package moved to profile".to_string(),
                             crate::widgets::ToastVariant::Success,

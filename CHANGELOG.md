@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Common Packages**: Packages can now be stored in a shared `[common]` section (like common files), visible across all profiles. TUI shows two sections ("Common Packages" and "Profile Packages") with section headers; `m` moves a package between sections. New keymap action `CreateCommon` (`Shift+C` / `Shift+O` / `Ctrl+Shift+O`) adds directly to common
 - **CLI `--common` flag**: All `dotstate packages` subcommands (`list`, `add`, `remove`, `check`, `install`) accept `--common` to operate on the shared package list instead of a profile
 
+### Fixed
+
+- **Packages**: Moving a package between the profile and common lists now carries its cached install status to the new list and removes the stale entry from the old one. If nothing was cached, a status check starts instead of leaving the package `Unknown` (and skipped by install) until a manual check
+
 ---
 
 ## [0.4.1] - 2026-09-22
