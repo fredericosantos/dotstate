@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Common Packages**: Packages can now be stored in a shared `[common]` section (like common files), visible across all profiles. TUI shows two sections ("Common Packages" and "Profile Packages") with section headers; `m` moves a package between sections. New keymap action `CreateCommon` (`Shift+C` / `Shift+O` / `Ctrl+Shift+O`) adds directly to common
 - **CLI `--common` flag**: All `dotstate packages` subcommands (`list`, `add`, `remove`, `check`, `install`) accept `--common` to operate on the shared package list instead of a profile
 
+### Fixed
+
+- **Packages**: Package names must now be unique across common, the target profile and its inherited profiles, enforced in the service layer for add and update (CLI and TUI). A clash returns an error naming the scope ("in common", "in profile 'X'", "inherited from 'Y'") and the CLI exits non-zero. A child profile may still override an inherited package with the same name and manager; the same name with a different manager is rejected
+
 ---
 
 ## [0.4.1] - 2026-09-22

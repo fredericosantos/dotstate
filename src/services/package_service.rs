@@ -61,9 +61,114 @@ pub struct PackageCreationParams<'a> {
     pub manager_check: &'a str,
 }
 
+/// Where a package lives, for name-collision checks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageScope<'a> {
+    /// The shared `[common]` list (visible to every profile).
+    Common,
+    /// A profile's own package list.
+    Profile(&'a str),
+}
+
 pub struct PackageService;
 
 impl PackageService {
+    /// The single name-uniqueness rule for packages. Every add/update path goes through this.
+    ///
+    /// A package NAME must be unique across the effective set seen from `scope`:
+    /// * `Common` target: no other common package, and no package in ANY profile's own list
+    ///   (common is visible to every profile, so a clash with any of them is a clash in that profile).
+    /// * `Profile(p)` target: no common package, no other package in `p`'s own list, and no package
+    ///   inherited from an ancestor, with ONE exception described below.
+    ///
+    /// Inheritance exception (deliberate): `ProfileManifest::resolve_packages` merges the chain on
+    /// the key `(name, manager)` with child-wins semantics, and the README documents inheritance as
+    /// "override only what's different". So a profile may redefine an ancestor's package when name
+    /// AND manager both match; that is the override feature, not a collision. Same name with a
+    /// different manager would survive the merge as two entries with one name (e.g. `git` via brew
+    /// and `git` via apt), so that is rejected as "inherited from 'Y'". Common-vs-profile and
+    /// same-scope clashes are never overrides and are always rejected.
+    ///
+    /// `skip_index` is the index (within the target scope's own list) of the package being edited,
+    /// so editing in place does not clash with itself.
+    ///
+    /// Not checked (known gap): adding to a parent profile does not look at descendants that
+    /// already define the same name with a different manager.
+    pub fn check_name_available(
+        manifest: &ProfileManifest,
+        scope: PackageScope<'_>,
+        name: &str,
+        manager: &PackageManager,
+        skip_index: Option<usize>,
+    ) -> Result<()> {
+        let clash = |what: &str| {
+            Err(anyhow::anyhow!(
+                "Package '{name}' is already defined {what}; package names must be unique across common and profile packages"
+            ))
+        };
+        let taken = |packages: &[Package]| {
+            packages
+                .iter()
+                .enumerate()
+                .any(|(i, p)| p.name == name && Some(i) != skip_index)
+        };
+
+        match scope {
+            PackageScope::Common => {
+                if taken(&manifest.common.packages) {
+                    return clash("in common");
+                }
+                if let Some(profile) = manifest
+                    .profiles
+                    .iter()
+                    .find(|p| p.packages.iter().any(|pkg| pkg.name == name))
+                {
+                    return clash(&format!("in profile '{}'", profile.name));
+                }
+            }
+            PackageScope::Profile(profile_name) => {
+                if manifest.common.packages.iter().any(|p| p.name == name) {
+                    return clash("in common");
+                }
+                let chain = manifest.inheritance_chain(profile_name)?;
+                // chain[0] is the target profile itself; the rest are ancestors, nearest first.
+                for (depth, scope_name) in chain.iter().enumerate() {
+                    let Some(profile) = manifest.profiles.iter().find(|p| &p.name == scope_name)
+                    else {
+                        continue;
+                    };
+                    if depth == 0 {
+                        if taken(&profile.packages) {
+                            return clash(&format!("in profile '{profile_name}'"));
+                        }
+                    } else if profile
+                        .packages
+                        .iter()
+                        .any(|p| p.name == name && p.manager != *manager)
+                    {
+                        return clash(&format!(
+                            "and inherited from '{scope_name}' with a different package manager \
+                             (override it with the same manager, or pick another name)"
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Convenience wrapper around [`Self::check_name_available`] that loads the manifest.
+    pub fn ensure_name_available(
+        repo_path: &Path,
+        scope: PackageScope<'_>,
+        name: &str,
+        manager: &PackageManager,
+        skip_index: Option<usize>,
+    ) -> Result<()> {
+        let manifest = ProfileManifest::load_or_backfill(repo_path)?;
+        Self::check_name_available(&manifest, scope, name, manager, skip_index)
+    }
+
     /// Get available package managers on this system.
     ///
     /// # Returns
@@ -295,6 +400,17 @@ impl PackageService {
 
         let mut manifest = ProfileManifest::load_or_backfill(repo_path)?;
 
+        if !manifest.has_profile(profile_name) {
+            return Err(anyhow::anyhow!("Profile '{profile_name}' not found"));
+        }
+        Self::check_name_available(
+            &manifest,
+            PackageScope::Profile(profile_name),
+            &package.name,
+            &package.manager,
+            None,
+        )?;
+
         if let Some(profile) = manifest
             .profiles
             .iter_mut()
@@ -328,6 +444,22 @@ impl PackageService {
         package: Package,
     ) -> Result<Vec<Package>> {
         let mut manifest = ProfileManifest::load_or_backfill(repo_path)?;
+
+        // Missing-profile / out-of-bounds keep their own errors below; only a valid target is checked.
+        if manifest
+            .profiles
+            .iter()
+            .find(|p| p.name == profile_name)
+            .is_some_and(|p| index < p.packages.len())
+        {
+            Self::check_name_available(
+                &manifest,
+                PackageScope::Profile(profile_name),
+                &package.name,
+                &package.manager,
+                Some(index),
+            )?;
+        }
 
         if let Some(profile) = manifest
             .profiles
@@ -434,10 +566,17 @@ impl PackageService {
     pub fn add_common_package(repo_path: &Path, package: Package) -> Result<Vec<Package>> {
         info!("Adding common package: {}", package.name);
         let mut manifest = ProfileManifest::load_or_backfill(repo_path)?;
+        Self::check_name_available(
+            &manifest,
+            PackageScope::Common,
+            &package.name,
+            &package.manager,
+            None,
+        )?;
         let name = package.name.clone();
         if !manifest.add_common_package(package) {
             return Err(anyhow::anyhow!(
-                "A common package named '{name}' already exists"
+                "Package '{name}' is already defined in common"
             ));
         }
         let packages = manifest.common.packages.clone();
@@ -455,6 +594,13 @@ impl PackageService {
     ) -> Result<Vec<Package>> {
         let mut manifest = ProfileManifest::load_or_backfill(repo_path)?;
         if index < manifest.common.packages.len() {
+            Self::check_name_available(
+                &manifest,
+                PackageScope::Common,
+                &package.name,
+                &package.manager,
+                Some(index),
+            )?;
             let old_name = manifest.common.packages[index].name.clone();
             info!("Updating common package: {} -> {}", old_name, package.name);
             manifest.common.packages[index] = package;
@@ -752,5 +898,230 @@ mod tests {
         let remaining = PackageService::delete_common_package(repo_path, 2).unwrap();
         let names: Vec<_> = remaining.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["bb", "cc"]);
+    }
+
+    // ---- name collision rule ----
+
+    fn make_pkg_with(name: &str, manager: PackageManager) -> Package {
+        let mut p = make_test_package(name);
+        p.manager = manager;
+        p
+    }
+
+    /// base <- work <- laptop, plus an unrelated `other` profile.
+    fn repo_with_chain() -> TempDir {
+        let temp_dir = TempDir::new().unwrap();
+        let mut manifest = ProfileManifest::default();
+        manifest.add_profile("base".to_string(), None);
+        manifest.add_profile_with_inherits("work".to_string(), None, Some("base".to_string()));
+        manifest.add_profile_with_inherits("laptop".to_string(), None, Some("work".to_string()));
+        manifest.add_profile("other".to_string(), None);
+        manifest.save(temp_dir.path()).unwrap();
+        temp_dir
+    }
+
+    fn err_text<T>(r: Result<T>) -> String {
+        format!("{}", r.err().expect("expected an error"))
+    }
+
+    #[test]
+    fn test_add_profile_package_rejected_when_in_common() {
+        let dir = repo_with_chain();
+        let repo = dir.path();
+        PackageService::add_common_package(repo, make_pkg_with("git", PackageManager::Brew))
+            .unwrap();
+        // Different manager, same name: the exact scenario from the bug report.
+        let msg = err_text(PackageService::add_package(
+            repo,
+            "work",
+            make_pkg_with("git", PackageManager::Apt),
+        ));
+        assert!(msg.contains("already defined in common"), "{msg}");
+        assert!(PackageService::get_packages(repo, "work")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn test_add_common_package_rejected_when_in_any_profile() {
+        let dir = repo_with_chain();
+        let repo = dir.path();
+        PackageService::add_package(repo, "other", make_test_package("git")).unwrap();
+        let msg = err_text(PackageService::add_common_package(
+            repo,
+            make_pkg_with("git", PackageManager::Apt),
+        ));
+        assert!(msg.contains("in profile 'other'"), "{msg}");
+        assert!(PackageService::get_common_packages(repo)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn test_add_profile_package_rejected_same_scope() {
+        let dir = repo_with_chain();
+        let repo = dir.path();
+        PackageService::add_package(repo, "work", make_test_package("git")).unwrap();
+        let msg = err_text(PackageService::add_package(
+            repo,
+            "work",
+            make_pkg_with("git", PackageManager::Apt),
+        ));
+        assert!(msg.contains("in profile 'work'"), "{msg}");
+    }
+
+    #[test]
+    fn test_add_rejected_when_inherited_with_different_manager() {
+        let dir = repo_with_chain();
+        let repo = dir.path();
+        PackageService::add_package(repo, "base", make_pkg_with("git", PackageManager::Brew))
+            .unwrap();
+        // Direct child and grandchild both see base's package.
+        for profile in ["work", "laptop"] {
+            let msg = err_text(PackageService::add_package(
+                repo,
+                profile,
+                make_pkg_with("git", PackageManager::Apt),
+            ));
+            assert!(msg.contains("inherited from 'base'"), "{msg}");
+        }
+    }
+
+    #[test]
+    fn test_add_allowed_as_override_of_inherited_same_manager() {
+        // Child-wins override on (name, manager) is the documented inheritance feature.
+        let dir = repo_with_chain();
+        let repo = dir.path();
+        PackageService::add_package(repo, "base", make_pkg_with("git", PackageManager::Brew))
+            .unwrap();
+        let mut over = make_pkg_with("git", PackageManager::Brew);
+        over.description = Some("child override".to_string());
+        PackageService::add_package(repo, "laptop", over).unwrap();
+        let manifest = ProfileManifest::load_or_backfill(repo).unwrap();
+        let resolved = manifest.resolve_packages("laptop").unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].description.as_deref(), Some("child override"));
+    }
+
+    #[test]
+    fn test_add_allowed_across_unrelated_profiles_and_new_names() {
+        let dir = repo_with_chain();
+        let repo = dir.path();
+        PackageService::add_package(repo, "work", make_test_package("git")).unwrap();
+        // Sibling branch does not see work's packages.
+        PackageService::add_package(repo, "other", make_pkg_with("git", PackageManager::Apt))
+            .unwrap();
+        PackageService::add_common_package(repo, make_test_package("curl")).unwrap();
+    }
+
+    #[test]
+    fn test_update_profile_package_in_place_does_not_clash_with_itself() {
+        let dir = repo_with_chain();
+        let repo = dir.path();
+        PackageService::add_package(repo, "work", make_test_package("git")).unwrap();
+        let mut edited = make_test_package("git");
+        edited.description = Some("edited".to_string());
+        let pkgs = PackageService::update_package(repo, "work", 0, edited).unwrap();
+        assert_eq!(pkgs[0].description.as_deref(), Some("edited"));
+    }
+
+    #[test]
+    fn test_update_profile_package_rename_rejected() {
+        let dir = repo_with_chain();
+        let repo = dir.path();
+        PackageService::add_common_package(repo, make_test_package("curl")).unwrap();
+        PackageService::add_package(repo, "base", make_test_package("jq")).unwrap();
+        PackageService::add_package(repo, "work", make_test_package("git")).unwrap();
+        PackageService::add_package(repo, "work", make_test_package("zsh")).unwrap();
+
+        // onto common
+        let msg = err_text(PackageService::update_package(
+            repo,
+            "work",
+            0,
+            make_test_package("curl"),
+        ));
+        assert!(msg.contains("already defined in common"), "{msg}");
+        // onto a sibling in the same profile
+        let msg = err_text(PackageService::update_package(
+            repo,
+            "work",
+            0,
+            make_test_package("zsh"),
+        ));
+        assert!(msg.contains("in profile 'work'"), "{msg}");
+        // onto an inherited package with a different manager
+        let msg = err_text(PackageService::update_package(
+            repo,
+            "work",
+            0,
+            make_pkg_with("jq", PackageManager::Apt),
+        ));
+        assert!(msg.contains("inherited from 'base'"), "{msg}");
+        // nothing was written
+        let names: Vec<_> = PackageService::get_packages(repo, "work")
+            .unwrap()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(names, ["git", "zsh"]);
+    }
+
+    #[test]
+    fn test_update_profile_package_rename_onto_inherited_same_manager_allowed() {
+        let dir = repo_with_chain();
+        let repo = dir.path();
+        PackageService::add_package(repo, "base", make_test_package("jq")).unwrap();
+        PackageService::add_package(repo, "work", make_test_package("git")).unwrap();
+        let pkgs =
+            PackageService::update_package(repo, "work", 0, make_test_package("jq")).unwrap();
+        assert_eq!(pkgs[0].name, "jq");
+    }
+
+    #[test]
+    fn test_update_common_package_rename_rejected() {
+        let dir = repo_with_chain();
+        let repo = dir.path();
+        PackageService::add_common_package(repo, make_test_package("aa")).unwrap();
+        PackageService::add_common_package(repo, make_test_package("bb")).unwrap();
+        PackageService::add_package(repo, "work", make_test_package("git")).unwrap();
+
+        // onto another common package
+        let msg = err_text(PackageService::update_common_package(
+            repo,
+            0,
+            make_test_package("bb"),
+        ));
+        assert!(msg.contains("already defined in common"), "{msg}");
+        // onto a profile package
+        let msg = err_text(PackageService::update_common_package(
+            repo,
+            0,
+            make_test_package("git"),
+        ));
+        assert!(msg.contains("in profile 'work'"), "{msg}");
+        // in-place edit of the same name is fine
+        let mut same = make_test_package("aa");
+        same.description = Some("d".to_string());
+        PackageService::update_common_package(repo, 0, same).unwrap();
+    }
+
+    #[test]
+    fn test_update_out_of_bounds_and_missing_profile_keep_their_errors() {
+        let dir = repo_with_chain();
+        let repo = dir.path();
+        let msg = err_text(PackageService::update_package(
+            repo,
+            "work",
+            3,
+            make_test_package("git"),
+        ));
+        assert!(msg.contains("out of bounds"), "{msg}");
+        let msg = err_text(PackageService::add_package(
+            repo,
+            "ghost",
+            make_test_package("git"),
+        ));
+        assert!(msg.contains("Profile 'ghost' not found"), "{msg}");
     }
 }

@@ -12,7 +12,7 @@ use crate::cli::common::{
     parse_manager, print_error, print_success, print_warning, prompt_confirm, prompt_manager,
     prompt_select_with_suffix, prompt_string, prompt_string_optional, CliContext,
 };
-use crate::services::{PackageCheckStatus, PackageCreationParams, PackageService};
+use crate::services::{PackageCheckStatus, PackageCreationParams, PackageScope, PackageService};
 use crate::utils::profile_manifest::Package;
 use anyhow::Result;
 use clap::Subcommand;
@@ -355,6 +355,17 @@ fn print_package_list(packages: &[Package], verbose: bool, check_status: bool, c
     }
 }
 
+/// Print the service's collision/validation error and exit non-zero; otherwise pass the value through.
+fn exit_on_name_clash<T>(result: Result<T>) -> T {
+    match result {
+        Ok(v) => v,
+        Err(e) => {
+            print_error(&e.to_string());
+            std::process::exit(1);
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_add(
     profile: Option<String>,
@@ -392,22 +403,11 @@ fn cmd_add(
 
     let is_active = ctx.is_active_profile(&profile_name);
 
-    // Get existing packages to check for duplicates
-    let existing = PackageService::get_packages(&ctx.config.repo_path, &profile_name)?;
-
     // Prompt for missing required fields
     let name = match name {
         Some(n) => n,
         None => prompt_string("Name", None)?,
     };
-
-    // Check for duplicate
-    if existing.iter().any(|p| p.name == name) {
-        print_error(&format!(
-            "Package '{name}' already exists in profile '{profile_name}'"
-        ));
-        std::process::exit(1);
-    }
 
     let manager = match manager {
         Some(m) => parse_manager(&m).ok_or_else(|| {
@@ -417,6 +417,15 @@ fn cmd_add(
         })?,
         None => prompt_manager(is_active)?,
     };
+
+    // Fail before prompting for the remaining fields; `add_package` re-checks on write.
+    exit_on_name_clash(PackageService::ensure_name_available(
+        &ctx.config.repo_path,
+        PackageScope::Profile(&profile_name),
+        &name,
+        &manager,
+        None,
+    ));
 
     let is_custom = matches!(
         manager,
@@ -497,7 +506,11 @@ fn cmd_add(
     });
 
     // Add to profile
-    PackageService::add_package(&ctx.config.repo_path, &profile_name, package)?;
+    exit_on_name_clash(PackageService::add_package(
+        &ctx.config.repo_path,
+        &profile_name,
+        package,
+    ));
 
     print_success(&format!(
         "Package '{name}' added to profile '{profile_name}'"
@@ -517,17 +530,10 @@ fn cmd_add_common(
     existence_check: Option<String>,
     ctx: &CliContext,
 ) -> Result<()> {
-    let existing = PackageService::get_common_packages(&ctx.config.repo_path)?;
-
     let name = match name {
         Some(n) => n,
         None => prompt_string("Name", None)?,
     };
-
-    if existing.iter().any(|p| p.name == name) {
-        print_error(&format!("Common package '{name}' already exists"));
-        std::process::exit(1);
-    }
 
     let manager = match manager {
         Some(m) => parse_manager(&m).ok_or_else(|| {
@@ -537,6 +543,15 @@ fn cmd_add_common(
         })?,
         None => prompt_manager(true)?,
     };
+
+    // Fail before prompting for the remaining fields; `add_common_package` re-checks on write.
+    exit_on_name_clash(PackageService::ensure_name_available(
+        &ctx.config.repo_path,
+        PackageScope::Common,
+        &name,
+        &manager,
+        None,
+    ));
 
     let is_custom = matches!(
         manager,
@@ -609,7 +624,10 @@ fn cmd_add_common(
         manager_check: "",
     });
 
-    PackageService::add_common_package(&ctx.config.repo_path, package)?;
+    exit_on_name_clash(PackageService::add_common_package(
+        &ctx.config.repo_path,
+        package,
+    ));
     print_success(&format!(
         "Common package '{name}' added (shared across all profiles)"
     ));
