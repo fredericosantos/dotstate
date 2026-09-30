@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Packages**: Moving a package between the profile and common lists now carries its cached install status to the new list and removes the stale entry from the old one. If nothing was cached, a status check starts instead of leaving the package `Unknown` (and skipped by install) until a manual check
 
+### Changed
+
+- **Manifest**: Schema version bumped 2 -> 3 (`[common] packages`), with a no-op v2 -> v3 migration that backs up the file first. Builds now refuse to load or overwrite a manifest with a version newer than they support, instead of silently dropping unknown fields on save. Note: builds that predate this guard (including upstream v0.4.1) do not check for newer versions and will still drop `[common] packages` if they save a v3 manifest
+
 ---
 
 ## [0.4.1] - 2026-09-22

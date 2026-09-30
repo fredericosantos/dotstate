@@ -5,7 +5,14 @@ use std::path::{Path, PathBuf};
 
 /// Current version of the manifest file format.
 /// Increment this when making breaking changes to the schema.
-const CURRENT_VERSION: u32 = 2;
+///
+/// A build refuses to load or overwrite a manifest whose version is newer than
+/// this value (see `ensure_supported_version`), because serde would silently
+/// drop any fields it does not know about on the next save.
+///
+/// History: v1 adds the version field, v2 adds profile inheritance, v3 adds
+/// `[common] packages`.
+const CURRENT_VERSION: u32 = 3;
 
 /// Maximum inheritance chain depth to prevent runaway resolution.
 const MAX_INHERITANCE_DEPTH: usize = 32;
@@ -97,6 +104,13 @@ pub struct CommonSection {
 /// Reserved profile names that cannot be used
 pub const RESERVED_PROFILE_NAMES: &[&str] = &["common"];
 
+/// Minimal view of the manifest used to read only the schema version.
+#[derive(Deserialize)]
+struct VersionProbe {
+    #[serde(default)]
+    version: u32,
+}
+
 /// Profile manifest stored in the repository root
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileManifest {
@@ -158,6 +172,10 @@ impl ProfileManifest {
                 .with_context(|| format!("Failed to read profile manifest: {manifest_path:?}"))?;
             let mut manifest: ProfileManifest =
                 toml::from_str(&content).with_context(|| "Failed to parse profile manifest")?;
+
+            // Refuse manifests written by a newer build: loading them would drop
+            // unknown fields on the next save.
+            Self::ensure_supported_version(manifest.version, &manifest_path)?;
 
             // Migrate if needed
             if manifest.version < CURRENT_VERSION {
@@ -304,8 +322,22 @@ impl ProfileManifest {
 
     /// Save the manifest to the repository.
     /// Uses atomic write (temp file + rename) to prevent corruption on crash.
+    ///
+    /// # Errors
+    /// Refuses to save (leaving the file untouched) if this manifest, or the
+    /// manifest already on disk, has a version newer than this build supports.
     pub fn save(&self, repo_path: &Path) -> Result<()> {
         let manifest_path = Self::manifest_path(repo_path);
+
+        Self::ensure_supported_version(self.version, &manifest_path)?;
+        // Also guard the on-disk file: a freshly built in-memory manifest
+        // (e.g. `Default`) must not clobber a newer manifest.
+        if let Ok(existing) = std::fs::read_to_string(&manifest_path) {
+            if let Ok(probe) = toml::from_str::<VersionProbe>(&existing) {
+                Self::ensure_supported_version(probe.version, &manifest_path)?;
+            }
+        }
+
         let temp_path = manifest_path.with_extension("toml.tmp");
 
         let content =
@@ -448,6 +480,18 @@ impl ProfileManifest {
 
     // ==================== Migration Methods ====================
 
+    /// Fail if `version` is newer than this build understands.
+    fn ensure_supported_version(version: u32, manifest_path: &Path) -> Result<()> {
+        if version > CURRENT_VERSION {
+            anyhow::bail!(
+                "Profile manifest {manifest_path:?} has version {version}, but this build of \
+                 DotState only supports up to version {CURRENT_VERSION}. It was written by a \
+                 newer DotState; saving would silently drop data. Upgrade DotState to continue."
+            );
+        }
+        Ok(())
+    }
+
     /// Run all necessary migrations to bring manifest to current version.
     fn migrate(mut manifest: Self) -> Result<Self> {
         if manifest.version == 0 {
@@ -455,6 +499,9 @@ impl ProfileManifest {
         }
         if manifest.version == 1 {
             manifest = Self::migrate_v1_to_v2(manifest)?;
+        }
+        if manifest.version == 2 {
+            manifest = Self::migrate_v2_to_v3(manifest)?;
         }
         Ok(manifest)
     }
@@ -472,6 +519,15 @@ impl ProfileManifest {
     fn migrate_v1_to_v2(mut manifest: Self) -> Result<Self> {
         tracing::debug!("Migrating manifest v1 -> v2 (adds profile inheritance support)");
         manifest.version = 2;
+        Ok(manifest)
+    }
+
+    /// Migrate from v2 to v3 (adds `[common] packages`).
+    /// No-op data-wise (`packages` defaults to empty via serde). The bump exists so
+    /// that builds which understand v3 can tell the file apart from a v2 one.
+    fn migrate_v2_to_v3(mut manifest: Self) -> Result<Self> {
+        tracing::debug!("Migrating manifest v2 -> v3 (adds common packages)");
+        manifest.version = 3;
         Ok(manifest)
     }
 
@@ -999,9 +1055,9 @@ synced_files = [".zshrc"]
 "#;
         std::fs::write(ProfileManifest::manifest_path(repo_path), v1_manifest).unwrap();
 
-        // Load should auto-migrate to v2
+        // Load should auto-migrate through v2 to the current version (v3)
         let loaded = ProfileManifest::load(repo_path).unwrap();
-        assert_eq!(loaded.version, 2);
+        assert_eq!(loaded.version, CURRENT_VERSION);
         assert!(loaded.is_common_file(".gitconfig"));
         assert!(loaded.has_profile("work"));
         // inherits should default to None
@@ -1538,5 +1594,101 @@ synced_files = []
         let loaded = ProfileManifest::load(repo_path).unwrap();
         assert_eq!(loaded.get_common_packages().len(), 0);
         assert!(loaded.is_common_file(".gitconfig"));
+    }
+
+    #[test]
+    fn test_manifest_migration_v2_to_v3_preserves_common_packages() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_path = temp_dir.path();
+        let manifest_path = ProfileManifest::manifest_path(repo_path);
+
+        // A v2 file that already carries common packages (written by a pre-bump build)
+        let mut v2 = ProfileManifest::default();
+        v2.version = 2;
+        v2.add_common_file(".gitconfig");
+        v2.add_common_package(make_package("git"));
+        v2.save(repo_path).unwrap();
+        assert!(std::fs::read_to_string(&manifest_path)
+            .unwrap()
+            .contains("version = 2"));
+
+        let loaded = ProfileManifest::load(repo_path).unwrap();
+        assert_eq!(loaded.version, 3);
+        assert!(loaded.is_common_package("git"));
+        assert!(loaded.is_common_file(".gitconfig"));
+
+        let content = std::fs::read_to_string(&manifest_path).unwrap();
+        assert!(content.contains("version = 3"));
+        // Backup is removed after a successful migration (existing convention)
+        assert!(!manifest_path.with_extension("toml.backup-v2").exists());
+    }
+
+    #[test]
+    fn test_manifest_migration_v2_to_v3_keeps_backup_when_save_fails() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_path = temp_dir.path();
+        let manifest_path = ProfileManifest::manifest_path(repo_path);
+        let v2_manifest = "version = 2\n\n[common]\nsynced_files = []\n";
+        std::fs::write(&manifest_path, v2_manifest).unwrap();
+        // A directory at the temp-file path makes the migrated save fail.
+        std::fs::create_dir(manifest_path.with_extension("toml.tmp")).unwrap();
+
+        assert!(ProfileManifest::load(repo_path).is_err());
+
+        let backup = manifest_path.with_extension("toml.backup-v2");
+        assert!(
+            backup.exists(),
+            "v2 backup must be created before migrating"
+        );
+        assert_eq!(std::fs::read_to_string(backup).unwrap(), v2_manifest);
+        assert_eq!(
+            std::fs::read_to_string(&manifest_path).unwrap(),
+            v2_manifest
+        );
+    }
+
+    #[test]
+    fn test_newer_manifest_version_is_rejected_and_not_overwritten() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_path = temp_dir.path();
+        let manifest_path = ProfileManifest::manifest_path(repo_path);
+        let newer = format!(
+            "version = {}\n\n[common]\nsynced_files = []\nfuture_field = \"x\"\n",
+            CURRENT_VERSION + 1
+        );
+        std::fs::write(&manifest_path, &newer).unwrap();
+
+        // Load refuses with a clear error
+        let err = ProfileManifest::load(repo_path).unwrap_err().to_string();
+        assert!(err.contains("newer DotState"), "unexpected error: {err}");
+        assert!(ProfileManifest::load_or_backfill(repo_path).is_err());
+
+        // A fresh in-memory manifest must not clobber the newer file
+        assert!(ProfileManifest::default().save(repo_path).is_err());
+
+        // A manifest carrying a newer version in memory must not save either
+        let mut in_memory = ProfileManifest::default();
+        in_memory.version = CURRENT_VERSION + 1;
+        let other = TempDir::new().unwrap();
+        assert!(in_memory.save(other.path()).is_err());
+        assert!(!ProfileManifest::manifest_path(other.path()).exists());
+
+        assert_eq!(std::fs::read_to_string(&manifest_path).unwrap(), newer);
+    }
+
+    #[test]
+    fn test_current_version_manifest_roundtrip_keeps_common_packages() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_path = temp_dir.path();
+
+        let mut manifest = ProfileManifest::default();
+        manifest.add_common_package(make_package("git"));
+        manifest.save(repo_path).unwrap();
+        // Saving again over an existing current-version file is allowed
+        manifest.save(repo_path).unwrap();
+
+        let loaded = ProfileManifest::load(repo_path).unwrap();
+        assert_eq!(loaded.version, CURRENT_VERSION);
+        assert!(loaded.is_common_package("git"));
     }
 }
