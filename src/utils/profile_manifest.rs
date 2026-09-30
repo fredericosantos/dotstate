@@ -703,11 +703,14 @@ impl ProfileManifest {
 
     /// Add a package to the common section (shared across all profiles).
     /// Deduplicates by name; keeps list sorted alphabetically.
-    pub fn add_common_package(&mut self, package: Package) {
-        if !self.common.packages.iter().any(|p| p.name == package.name) {
-            self.common.packages.push(package);
-            self.common.packages.sort_by(|a, b| a.name.cmp(&b.name));
+    /// Returns false (and leaves the list unchanged) if the name is already taken.
+    pub fn add_common_package(&mut self, package: Package) -> bool {
+        if self.common.packages.iter().any(|p| p.name == package.name) {
+            return false;
         }
+        self.common.packages.push(package);
+        self.common.packages.sort_by(|a, b| a.name.cmp(&b.name));
+        true
     }
 
     /// Remove a package from the common section by name.
@@ -732,22 +735,32 @@ impl ProfileManifest {
 
     /// Move a package from a profile to the common section.
     pub fn move_package_to_common(&mut self, profile_name: &str, index: usize) -> Result<()> {
-        // Extract the package from the profile first (releases mutable borrow)
-        let package =
-            if let Some(profile) = self.profiles.iter_mut().find(|p| p.name == profile_name) {
-                if index < profile.packages.len() {
-                    profile.packages.remove(index)
-                } else {
-                    return Err(anyhow::anyhow!(
-                        "Package index {index} out of bounds in profile '{profile_name}'"
-                    ));
-                }
-            } else {
-                return Err(anyhow::anyhow!(
-                    "Profile '{profile_name}' not found in manifest"
-                ));
-            };
+        let common_names: Vec<&str> = self
+            .common
+            .packages
+            .iter()
+            .map(|p| p.name.as_str())
+            .collect();
+        let profile = self
+            .profiles
+            .iter_mut()
+            .find(|p| p.name == profile_name)
+            .ok_or_else(|| anyhow::anyhow!("Profile '{profile_name}' not found in manifest"))?;
+        let name = profile
+            .packages
+            .get(index)
+            .map(|p| p.name.as_str())
+            .ok_or_else(|| {
+                anyhow::anyhow!("Package index {index} out of bounds in profile '{profile_name}'")
+            })?;
+        // Refuse before removing anything: a silent dedupe on the destination would lose the package.
+        if common_names.contains(&name) {
+            return Err(anyhow::anyhow!(
+                "A common package named '{name}' already exists"
+            ));
+        }
 
+        let package = profile.packages.remove(index);
         self.add_common_package(package);
         Ok(())
     }
@@ -764,20 +777,21 @@ impl ProfileManifest {
             ));
         }
 
-        let package = self.common.packages.remove(index);
-
-        if let Some(profile) = self.profiles.iter_mut().find(|p| p.name == profile_name) {
-            if !profile.packages.iter().any(|p| p.name == package.name) {
-                profile.packages.push(package);
-            }
-            Ok(())
-        } else {
-            // Restore the package to common if profile not found
-            self.common.packages.insert(index, package);
-            Err(anyhow::anyhow!(
-                "Profile '{profile_name}' not found in manifest"
-            ))
+        let name = &self.common.packages[index].name;
+        let profile = self
+            .profiles
+            .iter_mut()
+            .find(|p| p.name == profile_name)
+            .ok_or_else(|| anyhow::anyhow!("Profile '{profile_name}' not found in manifest"))?;
+        // Refuse before removing anything: a silent dedupe on the destination would lose the package.
+        if profile.packages.iter().any(|p| &p.name == name) {
+            return Err(anyhow::anyhow!(
+                "Profile '{profile_name}' already has a package named '{name}'"
+            ));
         }
+
+        profile.packages.push(self.common.packages.remove(index));
+        Ok(())
     }
 }
 
@@ -1389,7 +1403,7 @@ synced_files = [".zshrc"]
         assert!(manifest.is_common_package("ripgrep"));
 
         // Adding duplicate should not increase count
-        manifest.add_common_package(make_package("git"));
+        assert!(!manifest.add_common_package(make_package("git")));
         assert_eq!(manifest.get_common_packages().len(), 2);
 
         // Remove
@@ -1444,6 +1458,47 @@ synced_files = [".zshrc"]
         let profile = manifest.profiles.iter().find(|p| p.name == "work").unwrap();
         assert_eq!(profile.packages.len(), 1);
         assert_eq!(profile.packages[0].name, "git");
+    }
+
+    #[test]
+    fn test_move_package_to_common_name_collision_keeps_package() {
+        let mut manifest = ProfileManifest::default();
+        manifest.add_profile("work".to_string(), None);
+        manifest.add_common_package(make_package("git"));
+        if let Some(p) = manifest.profiles.iter_mut().find(|p| p.name == "work") {
+            p.packages.push(make_package("git"));
+        }
+
+        assert!(manifest.move_package_to_common("work", 0).is_err());
+
+        let profile = manifest.profiles.iter().find(|p| p.name == "work").unwrap();
+        assert_eq!(
+            profile.packages.len(),
+            1,
+            "package must stay in the profile"
+        );
+        assert_eq!(manifest.get_common_packages().len(), 1);
+    }
+
+    #[test]
+    fn test_move_package_from_common_name_collision_keeps_package() {
+        let mut manifest = ProfileManifest::default();
+        manifest.add_profile("work".to_string(), None);
+        manifest.add_common_package(make_package("git"));
+        if let Some(p) = manifest.profiles.iter_mut().find(|p| p.name == "work") {
+            p.packages.push(make_package("git"));
+        }
+
+        assert!(manifest
+            .move_package_from_common_by_index("work", 0)
+            .is_err());
+
+        assert!(
+            manifest.is_common_package("git"),
+            "package must stay in common"
+        );
+        let profile = manifest.profiles.iter().find(|p| p.name == "work").unwrap();
+        assert_eq!(profile.packages.len(), 1);
     }
 
     #[test]

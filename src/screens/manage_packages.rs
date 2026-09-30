@@ -42,7 +42,7 @@ enum SelectedPackageItem {
 
 pub struct ManagePackagesScreen {
     pub state: PackageManagerState,
-    /// Mouse regions for package list items (value = package index)
+    /// Mouse regions for package list items (value = flat display-row index, including section headers)
     mouse_regions: MouseRegions<usize>,
     /// Stored list pane area for scroll hit-testing
     list_pane_area: Option<Rect>,
@@ -427,8 +427,8 @@ impl ManagePackagesScreen {
         info!("Finished checking all packages");
 
         // Check if we just finished checking a newly added package
-        if let Some(new_idx) = state.newly_added_index.take() {
-            let status = if state.is_adding_common {
+        if let Some((new_idx, is_common)) = state.newly_added_index.take() {
+            let status = if is_common {
                 state.common_package_statuses.get(new_idx)
             } else {
                 state.package_statuses.get(new_idx)
@@ -480,7 +480,10 @@ impl ManagePackagesScreen {
                         p
                     } else {
                         error!("Package index {} out of bounds", package_index);
-                        failed.push((*package_index, "Package index out of bounds".to_string()));
+                        failed.push((
+                            package_name.clone(),
+                            "Package index out of bounds".to_string(),
+                        ));
                         self.advance_installation()?;
                         return Ok(());
                     };
@@ -549,7 +552,7 @@ impl ManagePackagesScreen {
                                         let err_msg =
                                             error.unwrap_or_else(|| "Unknown error".to_string());
                                         error!("Failed to install {}: {}", package_name, err_msg);
-                                        failed.push((*package_index, err_msg.clone()));
+                                        failed.push((package_name.clone(), err_msg.clone()));
                                         state.installation_output.push(format!(
                                             "❌ Failed to install {package_name}: {err_msg}"
                                         ));
@@ -566,7 +569,7 @@ impl ManagePackagesScreen {
                             // Thread died?
                             finished_current = true;
                             failed.push((
-                                *package_index,
+                                package_name.clone(),
                                 "Installation thread disconnected".to_string(),
                             ));
                             break;
@@ -1098,6 +1101,7 @@ impl ManagePackagesScreen {
             Action::Cancel | Action::Quit if state.is_checking => {
                 // If checking, maybe cancel check?
                 state.is_checking = false;
+                state.newly_added_index = None;
                 return Ok(ScreenAction::Refresh);
             }
             Action::Import if state.popup_type == PackagePopupType::None && !state.is_checking => {
@@ -1574,6 +1578,20 @@ impl ManagePackagesScreen {
                             });
                         let duplicate = duplicate_in_profile || duplicate_in_common;
 
+                        // Common packages are keyed by name in the manifest; a clash would be dropped
+                        let duplicate_common_name =
+                            editing_common
+                                && state.common_packages.iter().enumerate().any(|(idx, pkg)| {
+                                    edit_idx != Some(idx) && pkg.name == name.trim()
+                                });
+                        if duplicate_common_name {
+                            self.state.add_validation_error = Some(format!(
+                                "A common package named '{}' already exists",
+                                name.trim()
+                            ));
+                            return Ok(ScreenAction::Refresh);
+                        }
+
                         if duplicate {
                             warn!(
                                 "Package validation failed: duplicate binary name '{}'",
@@ -1604,6 +1622,7 @@ impl ManagePackagesScreen {
                         let active_profile = config.active_profile.clone();
                         let is_new_package = edit_idx.is_none();
                         let is_common = self.state.is_adding_common;
+                        let new_name = package.name.clone();
 
                         if is_common {
                             let common_packages = if let Some(idx) = edit_idx {
@@ -1611,8 +1630,10 @@ impl ManagePackagesScreen {
                             } else {
                                 PackageService::add_common_package(repo_path, package)?
                             };
+                            // The service keeps the list sorted by name, so the new package is
+                            // not necessarily last.
                             let new_pkg_idx = if is_new_package {
-                                Some(common_packages.len() - 1)
+                                common_packages.iter().position(|p| p.name == new_name)
                             } else {
                                 None
                             };
@@ -1627,7 +1648,7 @@ impl ManagePackagesScreen {
                                     self.state.common_package_statuses[idx] =
                                         PackageStatus::Unknown;
                                 }
-                                self.state.newly_added_index = Some(idx);
+                                self.state.newly_added_index = Some((idx, true));
                             }
                         } else {
                             let packages = if let Some(idx) = edit_idx {
@@ -1651,13 +1672,13 @@ impl ManagePackagesScreen {
                                 if idx < self.state.package_statuses.len() {
                                     self.state.package_statuses[idx] = PackageStatus::Unknown;
                                 }
-                                self.state.newly_added_index = Some(idx);
+                                self.state.newly_added_index = Some((idx, false));
                             }
                         }
 
                         self.reset_state();
-                        // Trigger check for the new/updated package
-                        self.state.is_checking = true;
+                        // Trigger check for the new/updated package (only Unknown statuses are checked)
+                        self.start_checking();
                         return Ok(ScreenAction::Refresh);
                     }
                     return Ok(ScreenAction::Refresh);
@@ -2313,7 +2334,7 @@ impl ManagePackagesScreen {
         self.state.popup_type = PackagePopupType::None;
         self.state.import_selected.clear();
         self.state.import_filter.clear();
-        self.state.is_checking = true;
+        self.start_checking();
 
         Ok(ScreenAction::Refresh)
     }
@@ -3006,14 +3027,17 @@ impl ManagePackagesScreen {
     ) -> Result<()> {
         use crate::widgets::{Dialog, DialogVariant};
 
-        let package_name = if let Some(idx) = self.state.delete_index {
-            self.state
-                .packages
-                .get(idx)
-                .map_or("Unknown", |p| p.name.as_str())
-        } else {
-            "Unknown"
-        };
+        let package_name = self
+            .state
+            .delete_index
+            .and_then(|idx| {
+                if self.state.is_adding_common {
+                    self.state.common_packages.get(idx)
+                } else {
+                    self.state.packages.get(idx)
+                }
+            })
+            .map_or("Unknown", |p| p.name.as_str());
 
         let content = format!(
             "⚠️  Delete Package\n\n\
@@ -3163,10 +3187,8 @@ impl ManagePackagesScreen {
                 if !failed.is_empty() {
                     summary.push_str(&format!("❌ Failed: {} package(s)\n\n", failed.len()));
                     summary.push_str("Failed packages:\n");
-                    for (idx, error) in failed {
-                        if let Some(pkg) = self.state.packages.get(*idx) {
-                            summary.push_str(&format!("  • {}: {}\n", pkg.name, error));
-                        }
+                    for (name, error) in failed {
+                        summary.push_str(&format!("  • {name}: {error}\n"));
                     }
                 }
 
@@ -3194,30 +3216,24 @@ impl ManagePackagesScreen {
     ) -> Result<()> {
         use crate::widgets::{Dialog, DialogVariant};
 
-        // Count missing packages
-        let missing_count = self
-            .state
-            .package_statuses
-            .iter()
-            .filter(|s| matches!(s, PackageStatus::NotInstalled))
-            .count();
-
+        // Missing packages, common first (same order as installation)
+        let is_missing = |s: Option<&PackageStatus>| matches!(s, Some(PackageStatus::NotInstalled));
         let missing_packages: Vec<String> = self
             .state
-            .packages
+            .common_packages
             .iter()
             .enumerate()
-            .filter_map(|(idx, pkg)| {
-                if matches!(
-                    self.state.package_statuses.get(idx),
-                    Some(PackageStatus::NotInstalled)
-                ) {
-                    Some(pkg.name.clone())
-                } else {
-                    None
-                }
-            })
+            .filter(|(idx, _)| is_missing(self.state.common_package_statuses.get(*idx)))
+            .chain(
+                self.state
+                    .packages
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, _)| is_missing(self.state.package_statuses.get(*idx))),
+            )
+            .map(|(_, pkg)| pkg.name.clone())
             .collect();
+        let missing_count = missing_packages.len();
 
         // Build content message
         let message = if missing_count == 1 {
@@ -3591,5 +3607,53 @@ impl ManagePackagesScreen {
 
         Footer::render(frame, area, &footer_text)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::package_cache::PackageCache;
+
+    fn custom_package(name: &str, existence_check: &str) -> Package {
+        Package {
+            name: name.to_string(),
+            description: None,
+            manager: PackageManager::Custom,
+            package_name: None,
+            binary_name: name.to_string(),
+            install_command: None,
+            existence_check: Some(existence_check.to_string()),
+            manager_check: None,
+        }
+    }
+
+    /// A newly added *common* package must be checked even after `reset_state()` cleared
+    /// `is_adding_common`, and the install prompt must inspect the common status list.
+    #[test]
+    fn newly_added_common_package_is_checked_and_prompts_install() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut screen = ManagePackagesScreen::new();
+        screen.state.cache = PackageCache::with_path(tmp.path().join("package_status.json"));
+        screen.update_all_packages(vec![custom_package("missing", "false")], Vec::new(), "main");
+
+        // State as left by the save handler: new common package, popup state reset.
+        screen.state.newly_added_index = Some((0, true));
+        screen.reset_state();
+        screen.start_checking();
+
+        for _ in 0..10 {
+            if !screen.state.is_checking {
+                break;
+            }
+            screen.process_package_check_step().unwrap();
+        }
+
+        assert!(!screen.state.is_checking);
+        assert!(matches!(
+            screen.state.common_package_statuses[0],
+            PackageStatus::NotInstalled
+        ));
+        assert_eq!(screen.state.popup_type, PackagePopupType::InstallMissing);
     }
 }

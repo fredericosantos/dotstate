@@ -1,12 +1,5 @@
 # DotState
 
-<a href="https://app.stele-ai.dev/explore/dotstate">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://app.stele-ai.dev/badge/dotstate?label=AI+Memory+by&message=stele&style=for-the-badge&color=blue&theme=dark&logo=stele">
-    <img src="https://app.stele-ai.dev/badge/dotstate?label=AI+Memory+by&message=stele&style=for-the-badge&color=blue&theme=light&logo=stele" alt="AI Memory by stele">
-  </picture>
-</a>
-
 **A modern, secure, and user-friendly dotfile manager built with Rust**
 
 DotState is a terminal-based tool that helps you manage your dotfiles effortlessly. Whether you're syncing your configuration across multiple machines or setting up a new development environment, DotState makes it simple, safe, and fast.
@@ -185,6 +178,7 @@ dotstate packages list                    # List packages with status
 dotstate packages add -n ripgrep -m brew -b rg  # Add a package
 dotstate packages check                   # Check what's installed
 dotstate packages install                 # Install missing packages
+dotstate packages add --common ...        # Any packages subcommand: use the list shared by all profiles
 
 # Check for updates and upgrade
 dotstate upgrade

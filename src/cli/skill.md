@@ -121,7 +121,7 @@ dotstate packages install           # install everything missing for the active 
 dotstate packages install --verbose # show the package manager's output
 ```
 
-Every packages command takes `--profile <name>` to target a profile other than the active one. `packages add` prompts on stdin for every value you leave out, including optional ones such as `--package-name`, `--description`, and (for `custom`) `--existence-check`. Pass them all, using an empty string where there is nothing to say. `packages install` never prompts for a sudo password. If a manager needs sudo and passwordless sudo is not available, the install is reported as blocked. Tell the user to run it themselves.
+Every packages command takes `--profile <name>` to target a profile other than the active one, or `--common` to target the list shared by all profiles (the two flags are mutually exclusive). `packages add` prompts on stdin for every value you leave out, including optional ones such as `--package-name`, `--description`, and (for `custom`) `--existence-check`. Pass them all, using an empty string where there is nothing to say. `packages install` never prompts for a sudo password. If a manager needs sudo and passwordless sudo is not available, the install is reported as blocked. Tell the user to run it themselves.
 
 ### Maintenance
 

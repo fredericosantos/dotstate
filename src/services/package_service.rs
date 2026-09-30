@@ -434,7 +434,12 @@ impl PackageService {
     pub fn add_common_package(repo_path: &Path, package: Package) -> Result<Vec<Package>> {
         info!("Adding common package: {}", package.name);
         let mut manifest = ProfileManifest::load_or_backfill(repo_path)?;
-        manifest.add_common_package(package);
+        let name = package.name.clone();
+        if !manifest.add_common_package(package) {
+            return Err(anyhow::anyhow!(
+                "A common package named '{name}' already exists"
+            ));
+        }
         let packages = manifest.common.packages.clone();
         manifest.save(repo_path)?;
         Ok(packages)
@@ -453,6 +458,9 @@ impl PackageService {
             let old_name = manifest.common.packages[index].name.clone();
             info!("Updating common package: {} -> {}", old_name, package.name);
             manifest.common.packages[index] = package;
+            // `ProfileManifest::load` sorts by name; keep the returned list (and the screen's
+            // copy of it) in the same order so later index-based calls address the same package.
+            manifest.common.packages.sort_by(|a, b| a.name.cmp(&b.name));
             let packages = manifest.common.packages.clone();
             manifest.save(repo_path)?;
             Ok(packages)
@@ -713,8 +721,36 @@ mod tests {
         let repo_path = temp_dir.path();
 
         PackageService::add_common_package(repo_path, make_test_package("git")).unwrap();
+        let result = PackageService::add_common_package(repo_path, make_test_package("git"));
+        assert!(
+            result.is_err(),
+            "Duplicate name must be reported, not dropped"
+        );
+        assert_eq!(
+            PackageService::get_common_packages(repo_path)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_update_common_package_keeps_list_sorted_for_index_addressing() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_path = temp_dir.path();
+
+        for name in ["aa", "bb", "cc"] {
+            PackageService::add_common_package(repo_path, make_test_package(name)).unwrap();
+        }
+        // Rename the first entry so that it sorts last.
         let packages =
-            PackageService::add_common_package(repo_path, make_test_package("git")).unwrap();
-        assert_eq!(packages.len(), 1, "Duplicate should not be added");
+            PackageService::update_common_package(repo_path, 0, make_test_package("zz")).unwrap();
+        let names: Vec<_> = packages.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["bb", "cc", "zz"]);
+
+        // Index 2 as seen by the caller must be the same package the service reloads.
+        let remaining = PackageService::delete_common_package(repo_path, 2).unwrap();
+        let names: Vec<_> = remaining.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, ["bb", "cc"]);
     }
 }

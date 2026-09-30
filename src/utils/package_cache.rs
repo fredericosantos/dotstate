@@ -86,6 +86,15 @@ impl Default for PackageCache {
 }
 
 impl PackageCache {
+    /// Empty cache backed by an explicit file, so tests never touch the user's real cache.
+    #[cfg(test)]
+    pub(crate) fn with_path(cache_file: PathBuf) -> Self {
+        Self {
+            cache_file,
+            data: PackageCacheData::default(),
+        }
+    }
+
     pub fn new() -> Result<Self> {
         let config_dir = crate::utils::get_config_dir();
         let cache_file = config_dir.join("package_status.json");

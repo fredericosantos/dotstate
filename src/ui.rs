@@ -230,9 +230,9 @@ pub struct PackageManagerState {
     pub add_editing_index: Option<usize>, // None for add, Some(index) for edit
     pub add_validation_error: Option<String>, // Validation error to display in popup
     pub is_adding_common: bool,           // True = Add/Edit popup targets common section
-    pub newly_added_index: Option<usize>, // Track newly added package to prompt install after check
+    pub newly_added_index: Option<(usize, bool)>, // (index, is_common) of a newly added package, to prompt install after check
     pub available_managers: Vec<crate::utils::profile_manifest::PackageManager>, // OS-filtered list
-    pub manager_list_state: ListState,    // For manager selection
+    pub manager_list_state: ListState,            // For manager selection
     // Delete popup state
     pub delete_confirm_input: crate::utils::TextInput,
     pub delete_index: Option<usize>,
@@ -392,12 +392,12 @@ pub enum InstallationStep {
         total_packages: usize,
         packages_to_install: Vec<(usize, bool)>, // (index, is_common) of packages to install
         installed: Vec<usize>,                   // Count of successfully installed packages
-        failed: Vec<(usize, String)>,            // (flat_index, error) of failed packages
+        failed: Vec<(String, String)>,           // (package name, error) of failed packages
         status_rx: Option<std::sync::mpsc::Receiver<InstallationStatus>>, // Channel receiver for status updates
     },
     Complete {
         installed: Vec<usize>,
-        failed: Vec<(usize, String)>, // (index, error message)
+        failed: Vec<(String, String)>, // (package name, error message)
     },
 }
 
