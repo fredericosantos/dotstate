@@ -57,7 +57,9 @@ fn standard_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("esc", Action::Cancel),
         KeyBinding::new("space", Action::ToggleSelect),
         KeyBinding::new("ctrl+a", Action::SelectAll),
-        KeyBinding::new("ctrl+shift+a", Action::DeselectAll),
+        // Alt+A, not Ctrl+Shift+A (plain terminals deliver that as Ctrl+A = SelectAll) and not
+        // Shift+A (the import popup's filter box is a text input; Shift+A must stay typeable).
+        KeyBinding::new("alt+a", Action::DeselectAll),
         // Global
         KeyBinding::new("q", Action::Quit),
         KeyBinding::new("ctrl+c", Action::Quit),
@@ -116,7 +118,9 @@ fn vim_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("esc", Action::Cancel),
         KeyBinding::new("space", Action::ToggleSelect),
         KeyBinding::new("ctrl+a", Action::SelectAll),
-        KeyBinding::new("ctrl+shift+a", Action::DeselectAll),
+        // Alt+A, not Ctrl+Shift+A (plain terminals deliver that as Ctrl+A = SelectAll) and not
+        // Shift+A (the import popup's filter box is a text input; Shift+A must stay typeable).
+        KeyBinding::new("alt+a", Action::DeselectAll),
         // Global - vim uses q to quit
         KeyBinding::new("q", Action::Quit),
         KeyBinding::new("ctrl+c", Action::Quit),
@@ -177,9 +181,10 @@ fn emacs_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("esc", Action::Cancel),
         KeyBinding::new("space", Action::ToggleSelect),
         KeyBinding::new("ctrl+a", Action::SelectAll),
-        KeyBinding::new("ctrl+shift+a", Action::DeselectAll),
+        // Alt+A, not Ctrl+Shift+A (plain terminals deliver that as Ctrl+A = SelectAll) and not
+        // Shift+A (the import popup's filter box is a text input; Shift+A must stay typeable).
+        KeyBinding::new("alt+a", Action::DeselectAll),
         // Global
-        KeyBinding::new("ctrl+x ctrl+c", Action::Quit), // Note: multi-key not supported yet
         KeyBinding::new("q", Action::Quit),
         KeyBinding::new("ctrl+c", Action::Quit),
         KeyBinding::new("ctrl+h", Action::Help),
@@ -193,8 +198,9 @@ fn emacs_bindings() -> Vec<KeyBinding> {
         KeyBinding::new("shift+o", Action::CreateCommon),
         KeyBinding::new("/", Action::Search), // Use / for search (Ctrl+S is used for Save)
         KeyBinding::new("ctrl+r", Action::Refresh),
-        KeyBinding::new("ctrl+r", Action::Refresh),
-        KeyBinding::new("ctrl+x s", Action::Sync), // Note: multi-key not supported yet
+        // Chords (C-x s, C-x C-c) are not supported: the parser rejects them and they never
+        // match. Sync uses Shift+S as in the other presets; Quit is covered by q / Ctrl+C.
+        KeyBinding::new("shift+s", Action::Sync),
         KeyBinding::new("s", Action::CheckStatus),
         KeyBinding::new("i", Action::Install),
         KeyBinding::new("shift+i", Action::Import),
@@ -300,35 +306,114 @@ mod tests {
         (parsed.code, mods)
     }
 
-    #[test]
-    fn test_manage_packages_bindings_have_no_collisions() {
+    const ALL_PRESETS: [KeymapPreset; 3] = [
+        KeymapPreset::Standard,
+        KeymapPreset::Vim,
+        KeymapPreset::Emacs,
+    ];
+
+    /// Collect bindings whose plain-terminal key is shared by two different actions.
+    /// Returns `(preset, key_a, action_a, key_b, action_b)` tuples.
+    fn find_collisions(
+        preset: KeymapPreset,
+        only: Option<&[Action]>,
+    ) -> Vec<(String, Action, String, Action)> {
         use std::collections::HashMap;
-        for preset in [
-            KeymapPreset::Standard,
-            KeymapPreset::Vim,
-            KeymapPreset::Emacs,
-        ] {
-            let mut seen: HashMap<_, (Action, String)> = HashMap::new();
-            for b in preset
-                .bindings()
-                .into_iter()
-                .filter(|b| MANAGE_PACKAGES_ACTIONS.contains(&b.action))
-                // Emacs chords ("ctrl+x s") are unparsable placeholders that never match.
-                .filter(|b| !b.key.contains(' '))
-            {
-                let key = plain_terminal_key(&b.key);
-                if let Some((other, other_key)) = seen.insert(key, (b.action, b.key.clone())) {
-                    assert_eq!(
-                        other,
-                        b.action,
-                        "{}: {:?} ({}) collides with {:?} ({})",
+        let mut seen: HashMap<_, (Action, String)> = HashMap::new();
+        let mut collisions = Vec::new();
+        for b in preset
+            .bindings()
+            .into_iter()
+            .filter(|b| only.is_none_or(|a| a.contains(&b.action)))
+        {
+            let key = plain_terminal_key(&b.key);
+            if let Some((other, other_key)) = seen.insert(key, (b.action, b.key.clone())) {
+                if other != b.action {
+                    collisions.push((other_key, other, b.key.clone(), b.action));
+                }
+            }
+        }
+        collisions
+    }
+
+    /// An unparsable key string never matches (`KeyBinding::matches` swallows the parse
+    /// error), so a typo or a chord like "ctrl+x s" would silently create a dead binding.
+    #[test]
+    fn test_all_preset_keys_parse() {
+        for preset in ALL_PRESETS {
+            for b in preset.bindings() {
+                if let Err(e) = b.parse() {
+                    panic!(
+                        "{}: binding {:?} for {:?} does not parse: {e}",
                         preset.name(),
-                        b.action,
                         b.key,
-                        other,
-                        other_key
+                        b.action
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn test_manage_packages_bindings_have_no_collisions() {
+        for preset in ALL_PRESETS {
+            let collisions = find_collisions(preset, Some(MANAGE_PACKAGES_ACTIONS));
+            assert!(
+                collisions.is_empty(),
+                "{}: colliding bindings (key_a, action_a, key_b, action_b): {collisions:?}",
+                preset.name()
+            );
+        }
+    }
+
+    /// Whole-preset flat check: no two actions share a key (after plain-terminal
+    /// normalisation). Every preset is a single context-agnostic map consulted by
+    /// `Keymap::get_action`, so the first binding wins and any shared key makes the
+    /// later action unreachable. There are currently no intentional overlaps; if one is
+    /// ever needed, whitelist it here with a comment instead of weakening the check.
+    const INTENTIONAL_OVERLAPS: &[(&str, &str)] = &[
+        // (preset name, key string) -- none at present.
+    ];
+
+    #[test]
+    fn test_no_action_shares_a_key_within_a_preset() {
+        for preset in ALL_PRESETS {
+            let collisions: Vec<_> = find_collisions(preset, None)
+                .into_iter()
+                .filter(|(ka, _, kb, _)| {
+                    !INTENTIONAL_OVERLAPS
+                        .iter()
+                        .any(|(p, k)| *p == preset.name() && (k == ka || k == kb))
+                })
+                .collect();
+            assert!(
+                collisions.is_empty(),
+                "{}: colliding bindings (key_a, action_a, key_b, action_b): {collisions:?}",
+                preset.name()
+            );
+        }
+    }
+
+    /// Every action must be reachable on a plain terminal: the binding, as a plain
+    /// terminal delivers it, must resolve back to that same action.
+    #[test]
+    fn test_every_binding_resolves_to_its_action_on_plain_terminal() {
+        use crate::keymap::Keymap;
+        for preset in ALL_PRESETS {
+            let keymap = Keymap {
+                preset,
+                overrides: Vec::new(),
+            };
+            for b in preset.bindings() {
+                let (code, mods) = plain_terminal_key(&b.key);
+                assert_eq!(
+                    keymap.get_action(code, mods),
+                    Some(b.action),
+                    "{}: {:?} ({}) is shadowed or unreachable on a plain terminal",
+                    preset.name(),
+                    b.action,
+                    b.key
+                );
             }
         }
     }
