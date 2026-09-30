@@ -128,8 +128,6 @@ Every packages command takes `--profile <name>` to target a profile other than t
 ```bash
 dotstate doctor --fix     # auto-fix what doctor can repair
 dotstate upgrade --check  # report whether a newer version exists
-dotstate omarchy --install    # Omarchy only: add DotState to the app launcher as a floating window
-dotstate omarchy --uninstall  # remove what --install added
 ```
 
 ## Common tasks

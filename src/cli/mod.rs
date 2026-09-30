@@ -16,7 +16,6 @@ mod completions;
 mod doctor;
 mod files;
 mod info;
-mod omarchy;
 pub mod packages;
 mod profiles;
 pub mod skill;
@@ -133,16 +132,6 @@ pub enum Commands {
         #[command(subcommand)]
         command: PackagesCommand,
     },
-    /// Add a floating launcher app entry on Omarchy
-    #[command(group(clap::ArgGroup::new("action").required(true).args(["install", "uninstall"])))]
-    Omarchy {
-        /// Add the launcher entry, icon, and floating window rule
-        #[arg(long)]
-        install: bool,
-        /// Remove everything --install added
-        #[arg(long)]
-        uninstall: bool,
-    },
     /// Generate command-line completions
     #[clap(alias = "completion")]
     Completions {
@@ -186,7 +175,6 @@ impl Cli {
             Some(Commands::Repository) => info::cmd_repository(),
             Some(Commands::Upgrade { check }) => upgrade::execute(check),
             Some(Commands::Packages { command }) => packages::execute(command),
-            Some(Commands::Omarchy { install, .. }) => omarchy::execute(install),
             Some(Commands::Completions { shell }) => completions::generate(shell),
             None => {
                 // No command provided, launch TUI

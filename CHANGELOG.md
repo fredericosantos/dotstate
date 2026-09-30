@@ -15,7 +15,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **CLI**: `dotstate --skill` prints a built-in agent skill (SKILL.md) that teaches AI agents DotState's concepts and commands. `dotstate --skill --install` installs it to `~/.claude/skills/dotstate/`.
 - **CLI**: `add` and `remove` accept `-y/--yes` to skip the confirmation prompt.
-- **Omarchy**: `dotstate omarchy --install` adds DotState to the Omarchy app launcher with an icon and a floating window. It supports both Omarchy 3 (`hyprland.conf`) and Omarchy 4 Quattro (`hyprland.lua`). `--uninstall` removes everything it added.
 
 ### Changed
 

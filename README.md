@@ -207,17 +207,6 @@ dotstate --skill --install
 
 The skill is embedded in the binary, so re-run `--install` after upgrading to pick up changes. `add` and `remove` accept `--yes` to skip the confirmation prompt in scripts.
 
-### Omarchy
-
-On [Omarchy](https://omarchy.org), register DotState as a launcher app that opens in a centered floating window:
-
-```bash
-dotstate omarchy --install    # launcher entry, icon, and floating window rule
-dotstate omarchy --uninstall  # remove them again
-```
-
-It works on Omarchy 3 (`hyprland.conf`) and Omarchy 4 (`hyprland.lua`). The window rule goes into a marked block in your Hyprland user config, so re-running is safe and uninstall leaves the file as it was.
-
 ## Shell Completions
 
 Generate completions for your shell:
