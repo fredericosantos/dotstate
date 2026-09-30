@@ -29,6 +29,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Packages**: Mouse-wheel scrolling in Manage Packages moves the selection 3 packages per tick and skips section headers (same step as Dotfile Selection), instead of counting headers as rows
 - **Packages**: After moving a package between the profile and common lists, the selection follows it into its new section instead of falling back to a neighbour
 
+- **Packages**: A manifest that already contains a name clash (written before the uniqueness rule existed, or hand-edited) can be edited again: an update that keeps the package's name and manager unchanged (e.g. description only) skips the uniqueness check. Renames and manager changes are still checked
+- **Packages**: Adding a package to (or renaming / changing the manager of a package in) a parent profile is now rejected when a descendant profile, direct or transitive, already defines the same name with a different manager ("already defined in descendant profile 'X' with a different manager"), since the child's resolved list would otherwise contain both. The same name and manager in a descendant remains a valid override
+
 ---
 
 ## [0.4.1] - 2026-09-22
