@@ -242,6 +242,29 @@ impl ProfileService {
         let mut symlink_mgr =
             SymlinkManager::new_with_backup(repo_path.to_path_buf(), backup_enabled)?;
 
+        // Refuse up front if the new links cannot all be created: once the old
+        // links are removed there is no clean way back.
+        let obstacles = symlink_mgr.find_activation_obstacles(&resolved_files);
+        if !obstacles.is_empty() {
+            let list = obstacles
+                .iter()
+                .map(|o| {
+                    format!(
+                        "  {} {} (needed for {})",
+                        o.blocker.display(),
+                        o.reason,
+                        o.target.display()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(anyhow::anyhow!(
+                "Cannot switch to '{target_profile_name}': {} path(s) would block the new links. \
+                 Nothing was changed. Remove or fix these, then retry:\n{list}",
+                obstacles.len()
+            ));
+        }
+
         // Step 1: Deactivate old profile (removes ALL tracked symlinks)
         let removed = match symlink_mgr.deactivate_profile_with_restore(old_profile_name, false) {
             Ok(ops) => ops,
