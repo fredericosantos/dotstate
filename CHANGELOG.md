@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [0.4.2] - 2026-10-18
+
 ### Added
 
 - **Common Packages**: Packages can now be stored in a shared `[common]` section (like common files), visible across all profiles. TUI shows two sections ("Common Packages" and "Profile Packages") with section headers; `m` moves a package between sections. New keymap action `CreateCommon` (`Shift+C` Standard, `Shift+O` Vim/Emacs) adds directly to common
