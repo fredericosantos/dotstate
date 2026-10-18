@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [0.4.5] - 2026-10-18
+
 ### Fixed
 
 - **Packages**: `packages list`, `check` and `install` now use the profile's resolved packages, including those inherited from its ancestors. They only read the profile's own list, so a profile that inherits everything reported "No packages configured" and its inherited packages could not be installed. `add` and `remove` still edit only the profile's own list, and common packages are still handled with `--common`.
