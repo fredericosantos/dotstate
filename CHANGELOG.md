@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [0.4.3] - 2026-10-18
+
+### Changed
+
+- **Fork**: Merged upstream `main` (sync-with-remote runs on a background thread with an animated spinner, #66; `tokio`, `serde_json`, `toml`, `indoc` patch bumps). No manifest or profile changes since 0.4.2.
+
 ### Added
 
 - **Sync with Remote**: Show an animated loading spinner dialog while syncing, so large payloads and slow connections give visible feedback instead of a frozen screen. Sync now runs on a background thread with the result polled via `tick()`, and both screens share one spinner frame table.
