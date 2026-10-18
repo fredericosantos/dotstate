@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.4.4] - 2026-10-18
+
+### Fixed
+
+- **Manifest**: Loading the profile manifest no longer writes to disk. Old versions are migrated in memory and persisted by the next `save()`. `list`, `doctor` and every other read path used to rewrite the tracked `.dotstate-profiles.toml`, leaving an uncommitted change that `sync` would commit.
+- **Profiles**: `profile switch` checks that every new link can be created before removing the old ones. A file, dangling symlink, symlink to a file, or symlink into the repo in the way is reported and nothing is changed. Previously the old links were removed first, and the rollback could not run when the old profile no longer existed in the manifest (for example after a rename).
+
+---
+
 ## [0.4.3] - 2026-10-18
 
 ### Changed
