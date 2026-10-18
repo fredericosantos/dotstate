@@ -33,6 +33,17 @@ pub enum OperationStatus {
     RolledBack,
 }
 
+/// A path that would stop a link from being created (see `find_activation_obstacles`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivationObstacle {
+    /// The link that could not be created.
+    pub target: PathBuf,
+    /// The existing path in the way.
+    pub blocker: PathBuf,
+    /// Why it is in the way.
+    pub reason: String,
+}
+
 /// Report of a profile switch operation
 #[derive(Debug)]
 pub struct SwitchReport {
@@ -401,6 +412,85 @@ impl SymlinkManager {
         );
 
         Ok(operations)
+    }
+
+    /// Find paths that would make creating the given links fail part-way, without
+    /// changing anything. Run this before removing the old profile's links, so a
+    /// switch that cannot complete is refused up front instead of leaving the home
+    /// directory half-switched.
+    ///
+    /// Only real obstacles are reported: an ancestor of a link target that is a file,
+    /// a dangling symlink, a symlink to a file, or a symlink into the dotfiles repo
+    /// (the new link would then point at itself). Symlinked ancestor directories
+    /// that resolve elsewhere are fine, and so are ancestors this manager tracks:
+    /// they are removed before the new links are created.
+    pub fn find_activation_obstacles(
+        &self,
+        resolved_files: &[crate::utils::profile_manifest::ResolvedFile],
+    ) -> Vec<ActivationObstacle> {
+        let home_dir = crate::utils::get_home_dir();
+        self.find_activation_obstacles_with_home(resolved_files, &home_dir)
+    }
+
+    fn find_activation_obstacles_with_home(
+        &self,
+        resolved_files: &[crate::utils::profile_manifest::ResolvedFile],
+        home_dir: &Path,
+    ) -> Vec<ActivationObstacle> {
+        let repo_real =
+            fs::canonicalize(&self.repo_path).unwrap_or_else(|_| self.repo_path.clone());
+        let mut obstacles: Vec<ActivationObstacle> = Vec::new();
+
+        for resolved in resolved_files {
+            let target = home_dir.join(&resolved.relative_path);
+            let Some(parent) = target.parent() else {
+                continue;
+            };
+            let Ok(below_home) = parent.strip_prefix(home_dir) else {
+                continue;
+            };
+
+            let mut ancestor = home_dir.to_path_buf();
+            for component in below_home.components() {
+                ancestor.push(component);
+                let Ok(meta) = fs::symlink_metadata(&ancestor) else {
+                    break; // missing from here down: it will be created
+                };
+                let reason = if meta.file_type().is_symlink() {
+                    if self.tracking.symlinks.iter().any(|s| s.target == ancestor) {
+                        break; // our own link: removed before activation
+                    }
+                    match fs::metadata(&ancestor) {
+                        Err(_) => Some("is a dangling symlink".to_string()),
+                        Ok(m) if !m.is_dir() => Some("is a symlink to a file".to_string()),
+                        Ok(_) => match fs::canonicalize(&ancestor) {
+                            Ok(real) if real.starts_with(&repo_real) => Some(
+                                "is a symlink into the dotfiles repo (the new link would point at itself)"
+                                    .to_string(),
+                            ),
+                            _ => None,
+                        },
+                    }
+                } else if !meta.is_dir() {
+                    Some("is a file, not a directory".to_string())
+                } else {
+                    None
+                };
+
+                if let Some(reason) = reason {
+                    if !obstacles.iter().any(|o| o.blocker == ancestor) {
+                        obstacles.push(ActivationObstacle {
+                            target: target.clone(),
+                            blocker: ancestor.clone(),
+                            reason,
+                        });
+                    }
+                    break;
+                }
+            }
+        }
+
+        obstacles
     }
 
     /// Switch from one profile to another
@@ -1723,6 +1813,74 @@ mod tests {
 
         // Cleanup: remove the symlink created in the home directory
         let _ = fs::remove_file(&symlink_target);
+    }
+
+    fn resolved(path: &str) -> Vec<crate::utils::profile_manifest::ResolvedFile> {
+        vec![crate::utils::profile_manifest::ResolvedFile {
+            relative_path: path.to_string(),
+            source_profile: "p".to_string(),
+        }]
+    }
+
+    #[test]
+    fn test_obstacles_dangling_symlink_parent() {
+        let (temp_dir, manager) = setup_test_env();
+        let home = temp_dir.path();
+        fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::os::unix::fs::symlink(home.join("gone"), home.join(".ssh/config.d")).unwrap();
+
+        let found = manager
+            .find_activation_obstacles_with_home(&resolved(".ssh/config.d/leonardo.conf"), home);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].blocker, home.join(".ssh/config.d"));
+        assert!(found[0].reason.contains("dangling"));
+    }
+
+    #[test]
+    fn test_obstacles_symlink_into_repo_would_self_link() {
+        let (temp_dir, manager) = setup_test_env();
+        let home = temp_dir.path();
+        let repo_dir = home.join("dotstate/p/.ssh/config.d");
+        fs::create_dir_all(&repo_dir).unwrap();
+        fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::os::unix::fs::symlink(&repo_dir, home.join(".ssh/config.d")).unwrap();
+
+        let found = manager
+            .find_activation_obstacles_with_home(&resolved(".ssh/config.d/leonardo.conf"), home);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].reason.contains("point at itself"));
+    }
+
+    #[test]
+    fn test_obstacles_file_in_place_of_directory() {
+        let (temp_dir, manager) = setup_test_env();
+        let home = temp_dir.path();
+        fs::write(home.join(".config"), b"not a dir").unwrap();
+
+        let found = manager.find_activation_obstacles_with_home(&resolved(".config/a.toml"), home);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].reason.contains("not a directory"));
+    }
+
+    #[test]
+    fn test_obstacles_none_for_clean_missing_and_foreign_symlinked_dirs() {
+        let (temp_dir, manager) = setup_test_env();
+        let home = temp_dir.path();
+        // Missing parents are created later; real dirs are fine.
+        fs::create_dir_all(home.join(".config")).unwrap();
+        // A user-managed directory symlink that resolves outside the repo is legitimate.
+        let elsewhere = home.join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, home.join(".local")).unwrap();
+
+        for path in [".config/new/a.toml", ".missing/b", ".local/c", ".zshrc"] {
+            assert!(
+                manager
+                    .find_activation_obstacles_with_home(&resolved(path), home)
+                    .is_empty(),
+                "unexpected obstacle for {path}"
+            );
+        }
     }
 
     // More tests would go here...

@@ -163,7 +163,8 @@ impl ProfileManifest {
     }
 
     /// Load the manifest from the repository.
-    /// Automatically migrates old manifest versions to the current version.
+    /// Old manifest versions are migrated in memory; the file on disk is left
+    /// untouched until the next `save()`.
     pub fn load(repo_path: &Path) -> Result<Self> {
         let manifest_path = Self::manifest_path(repo_path);
 
@@ -177,20 +178,18 @@ impl ProfileManifest {
             // unknown fields on the next save.
             Self::ensure_supported_version(manifest.version, &manifest_path)?;
 
-            // Migrate if needed
+            // Migrate in memory only. Loading must never write: `list`, `doctor` and
+            // other read-only commands go through here, and the manifest is a tracked
+            // file, so a silent rewrite shows up as an uncommitted change that
+            // `dotstate sync` would then commit. The next `save()` persists the
+            // current version.
             if manifest.version < CURRENT_VERSION {
-                let old_version = manifest.version;
                 tracing::info!(
-                    "Migrating manifest from v{} to v{}",
-                    old_version,
+                    "Migrating manifest from v{} to v{} (in memory)",
+                    manifest.version,
                     CURRENT_VERSION
                 );
                 manifest = Self::migrate(manifest)?;
-
-                // Backup, save, cleanup
-                super::migrate_file(&manifest_path, old_version, "toml", || {
-                    manifest.save(repo_path)
-                })?;
             }
 
             // Sort synced_files alphabetically to ensure consistent ordering
@@ -991,14 +990,18 @@ synced_files = [".zshrc"]
         assert!(loaded.is_common_file(".gitconfig"));
         assert!(loaded.has_profile("work"));
 
-        // File should be updated with current version
-        let content = std::fs::read_to_string(ProfileManifest::manifest_path(repo_path)).unwrap();
-        assert!(content.contains(&format!("version = {CURRENT_VERSION}")));
+        // Loading never writes: the file on disk is untouched and no backup is created
+        let manifest_path = ProfileManifest::manifest_path(repo_path);
+        assert_eq!(
+            std::fs::read_to_string(&manifest_path).unwrap(),
+            v0_manifest
+        );
+        assert!(!manifest_path.with_extension("toml.backup-v0").exists());
 
-        // Backup should be cleaned up
-        let backup_path =
-            ProfileManifest::manifest_path(repo_path).with_extension("toml.backup-v0");
-        assert!(!backup_path.exists());
+        // The next save persists the current version
+        loaded.save(repo_path).unwrap();
+        let content = std::fs::read_to_string(&manifest_path).unwrap();
+        assert!(content.contains(&format!("version = {CURRENT_VERSION}")));
     }
 
     #[test]
@@ -1617,34 +1620,37 @@ synced_files = []
         assert!(loaded.is_common_package("git"));
         assert!(loaded.is_common_file(".gitconfig"));
 
+        // Loading never writes: still v2 on disk, no backup left behind
+        let content = std::fs::read_to_string(&manifest_path).unwrap();
+        assert!(content.contains("version = 2"));
+        assert!(!manifest_path.with_extension("toml.backup-v2").exists());
+
+        // The next save persists v3 without losing the common packages
+        loaded.save(repo_path).unwrap();
         let content = std::fs::read_to_string(&manifest_path).unwrap();
         assert!(content.contains("version = 3"));
-        // Backup is removed after a successful migration (existing convention)
-        assert!(!manifest_path.with_extension("toml.backup-v2").exists());
+        let reloaded = ProfileManifest::load(repo_path).unwrap();
+        assert!(reloaded.is_common_package("git"));
     }
 
     #[test]
-    fn test_manifest_migration_v2_to_v3_keeps_backup_when_save_fails() {
+    fn test_load_of_old_manifest_never_touches_disk() {
         let temp_dir = TempDir::new().unwrap();
         let repo_path = temp_dir.path();
         let manifest_path = ProfileManifest::manifest_path(repo_path);
         let v2_manifest = "version = 2\n\n[common]\nsynced_files = []\n";
         std::fs::write(&manifest_path, v2_manifest).unwrap();
-        // A directory at the temp-file path makes the migrated save fail.
+        // A directory at the temp-file path would make any save fail: load must not try one.
         std::fs::create_dir(manifest_path.with_extension("toml.tmp")).unwrap();
 
-        assert!(ProfileManifest::load(repo_path).is_err());
+        let loaded = ProfileManifest::load(repo_path).unwrap();
+        assert_eq!(loaded.version, CURRENT_VERSION);
 
-        let backup = manifest_path.with_extension("toml.backup-v2");
-        assert!(
-            backup.exists(),
-            "v2 backup must be created before migrating"
-        );
-        assert_eq!(std::fs::read_to_string(backup).unwrap(), v2_manifest);
         assert_eq!(
             std::fs::read_to_string(&manifest_path).unwrap(),
             v2_manifest
         );
+        assert!(!manifest_path.with_extension("toml.backup-v2").exists());
     }
 
     #[test]
