@@ -131,6 +131,34 @@ fn isolation_redirects_log_and_config_into_temp_dir() -> Result<()> {
 }
 
 #[test]
+fn list_and_check_include_packages_inherited_from_a_parent_profile() -> Result<()> {
+    // Regression: `list`/`check`/`install` used to read only the profile's own package list, so a
+    // profile that inherits everything reported "No packages configured".
+    let cli = Cli::new()?;
+    let r = cli.add(&["--profile", "default"], "parenttool", "true");
+    assert!(r.status_ok, "{}", r.all());
+
+    let mut manifest = cli.env.load_manifest()?;
+    manifest.add_profile_with_inherits("child".to_string(), None, Some("default".to_string()));
+    manifest.save(&cli.env.repo_path)?;
+
+    let r = cli.run(&["packages", "list", "-p", "child"]);
+    assert!(r.status_ok, "{}", r.all());
+    assert!(r.stdout.contains("parenttool"), "{}", r.all());
+    assert!(!r.stdout.contains("No packages configured"), "{}", r.all());
+
+    // `add`/`remove` still edit only the profile's own list.
+    let manifest = cli.env.load_manifest()?;
+    let child = manifest
+        .profiles
+        .iter()
+        .find(|p| p.name == "child")
+        .unwrap();
+    assert!(child.packages.is_empty());
+    Ok(())
+}
+
+#[test]
 fn add_common_then_list_common_shows_it() -> Result<()> {
     let cli = Cli::new()?;
     let r = cli.add(&["--common"], "mytool", "true");

@@ -614,6 +614,16 @@ impl PackageService {
             .unwrap_or_default())
     }
 
+    /// Get the packages in effect for a profile: its own plus those inherited from its
+    /// ancestors (child wins on name + manager). Common packages are listed separately.
+    ///
+    /// Use this for read and install paths. Editing paths (`add`, `remove`) keep using
+    /// [`Self::get_packages`] because they only ever change the profile's own list.
+    pub fn get_resolved_packages(repo_path: &Path, profile_name: &str) -> Result<Vec<Package>> {
+        let manifest = ProfileManifest::load_or_backfill(repo_path)?;
+        manifest.resolve_packages(profile_name)
+    }
+
     /// Get common packages shared across all profiles.
     pub fn get_common_packages(repo_path: &Path) -> Result<Vec<Package>> {
         let manifest = ProfileManifest::load_or_backfill(repo_path)?;
@@ -1061,6 +1071,26 @@ mod tests {
         let resolved = manifest.resolve_packages("laptop").unwrap();
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].description.as_deref(), Some("child override"));
+    }
+
+    #[test]
+    fn test_get_resolved_packages_includes_inherited_but_get_packages_does_not() {
+        // `laptop` inherits `work`, which inherits `base`; `laptop` has no packages of its own.
+        let dir = repo_with_chain();
+        let repo = dir.path();
+        PackageService::add_package(repo, "base", make_test_package("git")).unwrap();
+        PackageService::add_package(repo, "work", make_test_package("curl")).unwrap();
+
+        assert!(PackageService::get_packages(repo, "laptop")
+            .unwrap()
+            .is_empty());
+
+        let names: Vec<String> = PackageService::get_resolved_packages(repo, "laptop")
+            .unwrap()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(names, vec!["curl".to_string(), "git".to_string()]);
     }
 
     #[test]

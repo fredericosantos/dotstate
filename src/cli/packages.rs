@@ -265,7 +265,7 @@ fn cmd_list(profile: Option<String>, verbose: bool, common: bool) -> Result<()> 
     }
 
     let is_active = ctx.is_active_profile(&profile_name);
-    let packages = PackageService::get_packages(&ctx.config.repo_path, &profile_name)?;
+    let packages = PackageService::get_resolved_packages(&ctx.config.repo_path, &profile_name)?;
 
     if packages.is_empty() {
         println!("No packages configured for profile '{profile_name}'");
@@ -785,7 +785,7 @@ fn cmd_check(profile: Option<String>, common: bool) -> Result<()> {
         return Ok(());
     }
 
-    let packages = PackageService::get_packages(&ctx.config.repo_path, &profile_name)?;
+    let packages = PackageService::get_resolved_packages(&ctx.config.repo_path, &profile_name)?;
 
     if packages.is_empty() {
         println!("No packages configured for profile '{profile_name}'");
@@ -889,7 +889,7 @@ fn cmd_install(profile: Option<String>, verbose: bool, common: bool) -> Result<(
         return Ok(());
     }
 
-    let packages = PackageService::get_packages(&ctx.config.repo_path, &profile_name)?;
+    let packages = PackageService::get_resolved_packages(&ctx.config.repo_path, &profile_name)?;
 
     if packages.is_empty() {
         println!("No packages configured for profile '{profile_name}'");
