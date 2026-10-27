@@ -26,6 +26,10 @@ pub struct Dotfile {
     pub is_common: bool,
     /// Whether this file was manually added via `config.custom_files` (not auto-detected)
     pub is_custom: bool,
+    /// Name of the ancestor profile that provides this file when the active profile inherits it
+    /// (read-only here: it can only be changed in that profile). `None` for the profile's own
+    /// and common files.
+    pub inherited_from: Option<String>,
 }
 
 impl FileManager {
@@ -60,6 +64,7 @@ impl FileManager {
                     description,
                     is_common: false,
                     is_custom: false,
+                    inherited_from: None,
                 });
             }
         }

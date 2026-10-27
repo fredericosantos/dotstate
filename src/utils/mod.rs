@@ -10,6 +10,7 @@ pub mod package_installer;
 pub mod package_manager;
 pub mod path;
 pub mod profile_manifest;
+pub mod profile_tree;
 pub mod profile_validation;
 pub mod spinner;
 pub mod style;
@@ -33,6 +34,9 @@ pub use path::{
     is_safe_to_add,
 };
 pub use profile_manifest::{ProfileInfo, ProfileManifest, ResolvedFile};
+pub use profile_tree::{
+    ancestor_chain, layered_files, profile_tree, FileLayer, TreeGlyphs, TreeRow, COMMON_LAYER,
+};
 pub use profile_validation::{sanitize_profile_name, validate_profile_name};
 pub use spinner::spinner_frame;
 pub use style::{

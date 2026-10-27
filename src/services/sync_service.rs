@@ -421,6 +421,7 @@ impl SyncService {
                 description: None,
                 is_common: false,
                 is_custom: true,
+                inherited_from: None,
             });
         }
 
@@ -448,6 +449,7 @@ impl SyncService {
                 description: None,
                 is_common: false,
                 is_custom: false,
+                inherited_from: None,
             });
         }
 
@@ -481,6 +483,38 @@ impl SyncService {
                     description: None,
                     is_common: true,
                     is_custom: false,
+                    inherited_from: None,
+                });
+            }
+        }
+
+        // Files the active profile inherits from its ancestors. They are in effect (linked) but can
+        // only be changed in the profile that provides them, so they are listed read-only.
+        let normalise = |p: &str| {
+            let p = p.replace('\\', "/");
+            p.strip_prefix("./").unwrap_or(&p).to_string()
+        };
+        let own_name = &config.active_profile;
+        for resolved in manifest.resolve_files(own_name).unwrap_or_default() {
+            if resolved.source_profile == *own_name || resolved.source_profile == "common" {
+                continue;
+            }
+            let rel = normalise(&resolved.relative_path);
+            if let Some(existing) = found
+                .iter_mut()
+                .find(|d| normalise(&d.relative_path.to_string_lossy()) == rel)
+            {
+                existing.inherited_from = Some(resolved.source_profile.clone());
+                existing.synced = true;
+            } else {
+                found.push(Dotfile {
+                    original_path: home_dir.join(&rel),
+                    relative_path: PathBuf::from(&rel),
+                    synced: true,
+                    description: None,
+                    is_common: false,
+                    is_custom: false,
+                    inherited_from: Some(resolved.source_profile.clone()),
                 });
             }
         }

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Profiles**: The profile list is now a tree. Each profile is nested under the profile it inherits from, to any depth, and `common` is not a row because it applies everywhere. The inheritance arrow and the cursor glyph are gone; the leading column shows the active profile and the selected row keeps its highlight colours. Each row shows its total and own file counts.
+- **Profiles**: The details pane groups files by the layer that provides them: `common`, then each ancestor from the root down, then `own`, with a count per layer. It scrolls with the page keys and the mouse wheel instead of stopping at ten files.
+- **Manage files**: Files inherited from ancestor profiles are listed in a read-only section per ancestor, between the common files and the profile's own files. Changing one shows which profile provides it.
+
 ---
 
 ## [0.4.5] - 2026-10-18
