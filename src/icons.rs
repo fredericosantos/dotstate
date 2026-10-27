@@ -346,6 +346,15 @@ impl Icons {
         }
     }
 
+    /// Branch glyphs for the profile tree. ASCII terminals get plain ASCII branches.
+    #[must_use]
+    pub fn tree_glyphs(&self) -> crate::utils::TreeGlyphs {
+        match self.icon_set {
+            IconSet::Ascii => crate::utils::TreeGlyphs::ASCII,
+            _ => crate::utils::TreeGlyphs::UNICODE,
+        }
+    }
+
     #[must_use]
     pub fn inherits(&self) -> &'static str {
         match self.icon_set {

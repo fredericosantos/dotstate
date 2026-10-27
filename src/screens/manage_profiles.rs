@@ -7,7 +7,8 @@ use crate::services::ProfileService;
 use crate::styles::{theme, LIST_HIGHLIGHT_SYMBOL};
 use crate::ui::Screen as ScreenId;
 use crate::utils::{
-    create_standard_layout, focused_border_style, unfocused_border_style, MouseRegions,
+    create_standard_layout, focused_border_style, layered_files, profile_tree,
+    unfocused_border_style, MouseRegions, TreeRow,
 };
 use crate::widgets::{DialogVariant, TextInputWidget, TextInputWidgetExt};
 use anyhow::Result;
@@ -15,7 +16,7 @@ use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, 
 use ratatui::prelude::*;
 use ratatui::widgets::{
     Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
-    Wrap,
+    ScrollbarState, Wrap,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -79,8 +80,15 @@ pub struct ProfileManagerState {
     pub create_description_area: Option<Rect>,
     pub create_inherits_from_area: Option<Rect>,
     pub create_copy_from_area: Option<Rect>,
-    // Cached profiles to reduce disk I/O
+    // Cached profiles to reduce disk I/O, in tree (depth-first) order
     pub profiles: Vec<crate::utils::ProfileInfo>,
+    // Tree layout for `profiles`: row `i` describes `profiles[i]`
+    pub tree: Vec<TreeRow>,
+    // Details pane: scroll offset, the largest valid offset and a page size, set while rendering
+    pub details_scroll: u16,
+    pub details_max_scroll: u16,
+    pub details_page: u16,
+    pub details_area: Option<Rect>,
     // Cached resolved files per profile (includes inherited + common)
     pub resolved_files: HashMap<String, Vec<crate::utils::ResolvedFile>>,
     // Validation error message
@@ -105,6 +113,11 @@ impl Default for ProfileManagerState {
             create_inherits_from_area: None,
             create_copy_from_area: None,
             profiles: Vec::new(),
+            tree: Vec::new(),
+            details_scroll: 0,
+            details_max_scroll: 0,
+            details_page: 1,
+            details_area: None,
             resolved_files: HashMap::new(),
             error_message: None,
         }
@@ -132,7 +145,19 @@ impl ManageProfilesScreen {
     /// Refresh the cached profiles from disk
     pub fn refresh_profiles(&mut self, repo_path: &std::path::Path) -> Result<()> {
         let profiles = crate::services::ProfileService::get_profiles(repo_path)?;
-        self.state.profiles = profiles;
+        // Keep `profiles` in tree order so list indices, selection and every index-based action
+        // stay consistent with what is drawn.
+        let tree = profile_tree(&profiles);
+        self.state.profiles = tree.iter().map(|r| profiles[r.index].clone()).collect();
+        self.state.tree = tree
+            .into_iter()
+            .enumerate()
+            .map(|(row, mut r)| {
+                r.index = row;
+                r
+            })
+            .collect();
+        self.state.details_scroll = 0;
 
         // Cache resolved files for each profile
         self.state.resolved_files.clear();
@@ -459,23 +484,32 @@ impl ManageProfilesScreen {
                 // Handle clicks in background list (only when no popup is open)
                 if !popup_open {
                     if let Some(&idx) = self.state.clickable_areas.hit_test(x, y) {
-                        self.state.list_state.select(Some(idx));
+                        self.select_row(idx);
                         return ScreenAction::Refresh;
                     }
                 }
             }
-            MouseEventKind::ScrollUp if !popup_open => {
-                let selected = self.state.list_state.selected().unwrap_or(0);
-                if selected > 0 {
-                    self.state.list_state.select(Some(selected - 1));
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if !popup_open => {
+                let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+                // The wheel scrolls whichever pane the pointer is over.
+                let over_details = self.state.details_area.is_some_and(|a| {
+                    mouse.column >= a.x
+                        && mouse.column < a.x + a.width
+                        && mouse.row >= a.y
+                        && mouse.row < a.y + a.height
+                });
+                if over_details {
+                    self.scroll_details(if up { -3 } else { 3 });
                     return ScreenAction::Refresh;
                 }
-            }
-            MouseEventKind::ScrollDown if !popup_open => {
                 let selected = self.state.list_state.selected().unwrap_or(0);
                 let max = self.state.profiles.len().saturating_sub(1);
-                if selected < max {
-                    self.state.list_state.select(Some((selected + 1).min(max)));
+                if up && selected > 0 {
+                    self.select_row(selected - 1);
+                    return ScreenAction::Refresh;
+                }
+                if !up && selected < max {
+                    self.select_row(selected + 1);
                     return ScreenAction::Refresh;
                 }
             }
@@ -492,15 +526,19 @@ impl ManageProfilesScreen {
     ) -> Result<()> {
         let t = theme();
         let icons = crate::icons::Icons::from_config(config);
+        let glyphs = icons.tree_glyphs();
         let active_profile = &config.active_profile;
 
         let items: Vec<ListItem> = self
             .state
             .profiles
             .iter()
-            .map(|profile| {
+            .zip(&self.state.tree)
+            .map(|(profile, row)| {
                 let is_active = profile.name == *active_profile;
-                let icon = if is_active {
+                // The leading column carries the active marker; the selected row is already
+                // distinguished by its highlight colours, so there is no cursor glyph.
+                let marker = if is_active {
                     icons.active_profile()
                 } else {
                     " "
@@ -513,21 +551,24 @@ impl ManageProfilesScreen {
                     t.text_style()
                 };
 
-                let file_count = profile.synced_files.len();
-                let file_text = if file_count == 1 {
-                    "1 file".to_string()
+                let own = profile.synced_files.len();
+                let total = self
+                    .state
+                    .resolved_files
+                    .get(&profile.name)
+                    .map_or(own, Vec::len);
+                let meta = if total == own {
+                    files_label(own)
                 } else {
-                    format!("{file_count} files")
+                    format!("{}, {own} own", files_label(total))
                 };
 
-                let inherit_text = if profile.inherits.is_some() {
-                    format!(" {}", icons.inherits())
-                } else {
-                    String::new()
-                };
-
-                let text = format!("{} {}{} ({})", icon, profile.name, inherit_text, file_text);
-                ListItem::new(text).style(name_style)
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("{marker} "), name_style),
+                    Span::styled(row.prefix(glyphs), Style::default().fg(t.text_muted)),
+                    Span::styled(profile.name.clone(), name_style),
+                    Span::styled(format!("  {meta}"), Style::default().fg(t.text_muted)),
+                ]))
             })
             .collect();
 
@@ -539,8 +580,7 @@ impl ManageProfilesScreen {
                     .title(" Profiles ")
                     .border_style(focused_border_style()),
             )
-            .highlight_style(t.highlight_style())
-            .highlight_symbol(LIST_HIGHLIGHT_SYMBOL);
+            .highlight_style(t.highlight_style());
 
         // Render with state
         frame.render_stateful_widget(list, area, &mut self.state.list_state);
@@ -565,9 +605,25 @@ impl ManageProfilesScreen {
     }
 
     /// Render profile details on the right
-    fn render_profile_details(&self, frame: &mut Frame, area: Rect, config: &Config) -> Result<()> {
+    fn render_profile_details(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        config: &Config,
+    ) -> Result<()> {
         let active_profile = &config.active_profile;
         let icons = crate::icons::Icons::from_config(config);
+        let t = theme();
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Profile Details ")
+            .border_type(theme().border_type(false))
+            .border_style(unfocused_border_style())
+            .padding(ratatui::widgets::Padding::new(1, 1, 1, 1));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        self.state.details_area = Some(area);
 
         // Find selected profile (use selected index, fallback to active, then first)
         let profile = self
@@ -581,179 +637,157 @@ impl ManageProfilesScreen {
                     .iter()
                     .find(|p| p.name == *active_profile)
             })
-            .or_else(|| self.state.profiles.first());
+            .or_else(|| self.state.profiles.first())
+            .cloned();
 
-        let t = theme();
-        if let Some(profile) = profile {
-            let is_active = profile.name == *active_profile;
-            let status = if is_active {
-                (format!("{} Active", icons.active_profile()), t.success)
-            } else {
-                (
-                    format!("{} Inactive", icons.inactive_profile()),
-                    t.text_emphasis,
-                )
-            };
-
-            let description = profile.description.as_deref().unwrap_or("No description");
-
-            // Use cached resolved files (populated in refresh_profiles)
-            let resolved = self.state.resolved_files.get(&profile.name);
-
-            let total_files_count = resolved.map_or(profile.synced_files.len(), Vec::len);
-
-            let files_text = if total_files_count == 0 {
-                "No files synced".to_string()
-            } else if let Some(resolved) = resolved {
-                // Single pass to categorize files by source
-                let (mut own_count, mut common_count, mut inherited_count) =
-                    (0usize, 0usize, 0usize);
-                for f in resolved {
-                    if f.source_profile == profile.name {
-                        own_count += 1;
-                    } else if f.source_profile == "common" {
-                        common_count += 1;
-                    } else {
-                        inherited_count += 1;
-                    }
-                }
-
-                if inherited_count > 0 || common_count > 0 {
-                    let mut parts = vec![format!("{own_count} own")];
-                    if inherited_count > 0 {
-                        parts.push(format!("{inherited_count} inherited"));
-                    }
-                    if common_count > 0 {
-                        parts.push(format!("{common_count} common"));
-                    }
-                    format!("{total_files_count} files synced ({}):", parts.join(", "))
-                } else {
-                    format!("{total_files_count} files synced:")
-                }
-            } else {
-                format!("{total_files_count} files synced:")
-            };
-
-            // Show resolved file list with source annotations for inherited files
-            let display_files: Vec<String> = if let Some(resolved) = resolved {
-                resolved
-                    .iter()
-                    .take(10)
-                    .map(|f| {
-                        if f.source_profile == profile.name {
-                            format!("  • {}", f.relative_path)
-                        } else {
-                            format!("  • {} [{}]", f.relative_path, f.source_profile)
-                        }
-                    })
-                    .collect()
-            } else {
-                profile
-                    .synced_files
-                    .iter()
-                    .take(10)
-                    .map(|f| format!("  • {f}"))
-                    .collect()
-            };
-            let files_list = display_files.join("\n");
-
-            let more_text = if total_files_count > 10 {
-                format!("\n  ... and {} more", total_files_count - 10)
-            } else {
-                String::new()
-            };
-
-            // Create styled text with colors
-            use ratatui::text::{Line, Span};
-            let mut lines = vec![
-                Line::from(vec![
-                    Span::styled(
-                        "Name: ",
-                        Style::default().fg(t.primary).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(&profile.name, t.text_style()),
-                ]),
-                Line::from(""),
-                Line::from(vec![
-                    Span::styled(
-                        "Status: ",
-                        Style::default().fg(t.primary).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(status.0, Style::default().fg(status.1)),
-                ]),
-                Line::from(""),
-            ];
-
-            // Show inheritance info
-            if let Some(ref parent) = profile.inherits {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        "Inherits: ",
-                        Style::default().fg(t.primary).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(parent, Style::default().fg(t.secondary)),
-                ]));
-                lines.push(Line::from(""));
-            }
-
-            lines.extend([
-                Line::from(vec![Span::styled(
-                    "Description:",
-                    Style::default().fg(t.primary).add_modifier(Modifier::BOLD),
-                )]),
-                Line::from(vec![Span::styled(
-                    description,
-                    Style::default().fg(t.text_muted),
-                )]),
-                Line::from(""),
-                Line::from(vec![Span::styled(
-                    &files_text,
-                    Style::default().fg(t.primary).add_modifier(Modifier::BOLD),
-                )]),
-            ]);
-
-            if !files_list.is_empty() {
-                for line in files_list.lines() {
-                    lines.push(Line::from(vec![Span::styled(line, t.text_style())]));
-                }
-            }
-            if !more_text.is_empty() {
-                lines.push(Line::from(vec![Span::styled(
-                    &more_text,
-                    Style::default().fg(t.text_muted),
-                )]));
-            }
-
-            let text = ratatui::text::Text::from(lines);
-
-            let paragraph = Paragraph::new(text)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" Profile Details ")
-                        .border_type(theme().border_type(false))
-                        .border_style(unfocused_border_style())
-                        .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
-                )
-                .wrap(Wrap { trim: true });
-
-            frame.render_widget(paragraph, area);
-        } else {
-            let paragraph =
+        let Some(profile) = profile else {
+            frame.render_widget(
                 Paragraph::new("No profiles found.\n\nPress 'C' to create your first profile.")
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title(" Profile Details ")
-                            .border_type(theme().border_type(false))
-                            .border_style(unfocused_border_style())
-                            .padding(ratatui::widgets::Padding::new(1, 1, 1, 1)),
-                    )
-                    .wrap(Wrap { trim: true });
-            frame.render_widget(paragraph, area);
+                    .wrap(Wrap { trim: true }),
+                inner,
+            );
+            self.state.details_max_scroll = 0;
+            return Ok(());
+        };
+
+        let is_active = profile.name == *active_profile;
+        let status = if is_active {
+            (format!("{} Active", icons.active_profile()), t.success)
+        } else {
+            (
+                format!("{} Inactive", icons.inactive_profile()),
+                t.text_emphasis,
+            )
+        };
+        let description = profile.description.as_deref().unwrap_or("No description");
+        let width = usize::from(inner.width);
+        let label = |text: &str| {
+            Span::styled(
+                text.to_string(),
+                Style::default().fg(t.primary).add_modifier(Modifier::BOLD),
+            )
+        };
+
+        // Fixed header: identity, status, inheritance chain, description.
+        let mut header: Vec<Line> = vec![
+            Line::from(vec![
+                label("Name: "),
+                Span::styled(profile.name.clone(), t.text_style()),
+            ]),
+            Line::from(vec![
+                label("Status: "),
+                Span::styled(status.0, Style::default().fg(status.1)),
+            ]),
+        ];
+        let chain = crate::utils::ancestor_chain(&profile.name, &self.state.profiles);
+        if !chain.is_empty() {
+            header.push(Line::from(vec![
+                label("Inherits: "),
+                Span::styled(
+                    truncate_to(&chain.join(" › "), width.saturating_sub(10)),
+                    Style::default().fg(t.secondary),
+                ),
+            ]));
+        }
+        header.push(Line::from(vec![
+            label("Description: "),
+            Span::styled(
+                truncate_to(description, width.saturating_sub(13)),
+                Style::default().fg(t.text_muted),
+            ),
+        ]));
+
+        // Scrolling body: files grouped by the layer that provides them.
+        let resolved = self.state.resolved_files.get(&profile.name);
+        let layers = match resolved {
+            Some(resolved) => layered_files(&profile.name, &self.state.profiles, resolved),
+            None => Vec::new(),
+        };
+        let total: usize = resolved.map_or(profile.synced_files.len(), Vec::len);
+        let text_width = width.saturating_sub(1); // one column is kept for the scrollbar
+        let mut body: Vec<Line> = vec![Line::from(Span::styled(
+            if total == 0 {
+                "No files synced".to_string()
+            } else {
+                format!("{} synced", files_label(total))
+            },
+            Style::default().fg(t.primary).add_modifier(Modifier::BOLD),
+        ))];
+        if resolved.is_none() {
+            // No resolved view (manifest could not be loaded): fall back to the profile's own list.
+            body.extend(profile.synced_files.iter().map(|f| {
+                Line::from(Span::styled(
+                    truncate_to(&format!("  • {f}"), text_width),
+                    t.text_style(),
+                ))
+            }));
+        }
+        for layer in &layers {
+            body.push(Line::from(""));
+            let title = if layer.is_own { "own" } else { &layer.name };
+            body.push(Line::from(vec![
+                Span::styled(
+                    title.to_string(),
+                    Style::default().fg(t.tertiary).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  {}", layer.files.len()),
+                    Style::default().fg(t.text_muted),
+                ),
+            ]));
+            body.extend(layer.files.iter().map(|f| {
+                Line::from(Span::styled(
+                    truncate_to(&format!("  • {f}"), text_width),
+                    t.text_style(),
+                ))
+            }));
+        }
+
+        let header_height = (header.len() as u16 + 1).min(inner.height);
+        let [header_area, body_area] =
+            Layout::vertical([Constraint::Length(header_height), Constraint::Min(0)]).areas(inner);
+        frame.render_widget(Paragraph::new(header), header_area);
+
+        let visible = body_area.height;
+        let max_scroll = (body.len() as u16).saturating_sub(visible);
+        self.state.details_max_scroll = max_scroll;
+        self.state.details_page = visible.saturating_sub(1).max(1);
+        self.state.details_scroll = self.state.details_scroll.min(max_scroll);
+
+        frame.render_widget(
+            Paragraph::new(body.clone()).scroll((self.state.details_scroll, 0)),
+            body_area,
+        );
+        if max_scroll > 0 {
+            let mut scrollbar_state = ScrollbarState::new(body.len())
+                .viewport_content_length(usize::from(visible))
+                .position(usize::from(self.state.details_scroll));
+            frame.render_stateful_widget(
+                Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                    .begin_symbol(None)
+                    .end_symbol(None),
+                body_area,
+                &mut scrollbar_state,
+            );
         }
 
         Ok(())
+    }
+
+    /// Select a list row, scrolling the details pane back to the top when the row changes.
+    fn select_row(&mut self, row: usize) {
+        if self.state.list_state.selected() != Some(row) {
+            self.state.details_scroll = 0;
+        }
+        self.state.list_state.select(Some(row));
+    }
+
+    /// Scroll the details pane by `delta` lines, clamped to its content.
+    fn scroll_details(&mut self, delta: i32) {
+        let next = i32::from(self.state.details_scroll)
+            .saturating_add(delta)
+            .clamp(0, i32::from(self.state.details_max_scroll));
+        self.state.details_scroll = next as u16;
     }
 
     /// Render the active popup
@@ -1299,8 +1333,10 @@ impl Screen for ManageProfilesScreen {
         // hotkeys visible-but-receded behind the modal.
         let k = |a| ctx.config.keymap.get_key_display_for_action(a);
         let footer_text = format!(
-            "{}: Navigate | {}: Switch Profile | {}: Create | {}: Rename | {}: Delete | {}: Back",
+            "{}: Navigate | {}/{}: Scroll Files | {}: Switch Profile | {}: Create | {}: Rename | {}: Delete | {}: Back",
             ctx.config.keymap.navigation_display(),
+            k(crate::keymap::Action::PageUp),
+            k(crate::keymap::Action::PageDown),
             k(crate::keymap::Action::Confirm),
             k(crate::keymap::Action::Create),
             k(crate::keymap::Action::Edit),
@@ -1826,7 +1862,15 @@ impl Screen for ManageProfilesScreen {
                         Action::MoveUp => {
                             let selected = self.state.list_state.selected().unwrap_or(0);
                             let new_selected = if selected > 0 { selected - 1 } else { selected };
-                            self.state.list_state.select(Some(new_selected));
+                            self.select_row(new_selected);
+                            return Ok(ScreenAction::Refresh);
+                        }
+                        Action::PageUp => {
+                            self.scroll_details(-i32::from(self.state.details_page));
+                            return Ok(ScreenAction::Refresh);
+                        }
+                        Action::PageDown => {
+                            self.scroll_details(i32::from(self.state.details_page));
                             return Ok(ScreenAction::Refresh);
                         }
                         Action::MoveDown => {
@@ -1838,7 +1882,7 @@ impl Screen for ManageProfilesScreen {
                                 } else {
                                     selected
                                 };
-                            self.state.list_state.select(Some(new_selected));
+                            self.select_row(new_selected);
                             return Ok(ScreenAction::Refresh);
                         }
                         Action::Create => {
@@ -1914,5 +1958,215 @@ impl Screen for ManageProfilesScreen {
             }
             ProfilePopupType::Switch | ProfilePopupType::None => false,
         }
+    }
+}
+
+/// "1 file" / "N files".
+fn files_label(count: usize) -> String {
+    if count == 1 {
+        "1 file".to_string()
+    } else {
+        format!("{count} files")
+    }
+}
+
+/// Cut `text` to at most `width` characters, ending with `…` when it was shortened.
+fn truncate_to(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(width.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::{ProfileInfo, ResolvedFile};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    fn info(name: &str, inherits: Option<&str>, own: &[&str]) -> ProfileInfo {
+        ProfileInfo {
+            name: name.to_string(),
+            description: None,
+            synced_files: own.iter().map(ToString::to_string).collect(),
+            packages: Vec::new(),
+            inherits: inherits.map(str::to_string),
+        }
+    }
+
+    fn resolved(entries: &[(&str, &str)]) -> Vec<ResolvedFile> {
+        entries
+            .iter()
+            .map(|(path, source)| ResolvedFile {
+                relative_path: (*path).to_string(),
+                source_profile: (*source).to_string(),
+            })
+            .collect()
+    }
+
+    /// A screen with `macos > macbook-pro > air` and `linux > server`, built without touching disk.
+    fn screen() -> ManageProfilesScreen {
+        let profiles = vec![
+            info("macos", None, &[".zprofile", ".zshrc.d/30-macos.zsh"]),
+            info("macbook-pro", Some("macos"), &[".claude/pro.md"]),
+            info("air", Some("macbook-pro"), &[".zshrc.d/90-palette.zsh"]),
+            info("linux", None, &[".bashrc"]),
+            info("server", Some("linux"), &[]),
+        ];
+        let tree = profile_tree(&profiles);
+        let mut screen = ManageProfilesScreen::new();
+        screen.state.profiles = tree.iter().map(|r| profiles[r.index].clone()).collect();
+        screen.state.tree = tree
+            .into_iter()
+            .enumerate()
+            .map(|(row, mut r)| {
+                r.index = row;
+                r
+            })
+            .collect();
+        screen.state.resolved_files.insert(
+            "air".to_string(),
+            resolved(&[
+                (".a", "common"),
+                (".b", "common"),
+                (".zprofile", "macos"),
+                (".claude/pro.md", "macbook-pro"),
+                (".zshrc.d/90-palette.zsh", "air"),
+            ]),
+        );
+        screen.state.list_state.select(Some(0));
+        screen
+    }
+
+    fn draw(
+        screen: &mut ManageProfilesScreen,
+        width: u16,
+        height: u16,
+        f: impl FnOnce(&mut ManageProfilesScreen, &mut Frame, Rect, &Config),
+    ) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let config = Config {
+            active_profile: "air".to_string(),
+            ..Config::default()
+        };
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                f(screen, frame, area, &config);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn select(screen: &mut ManageProfilesScreen, name: &str) {
+        let row = screen
+            .state
+            .profiles
+            .iter()
+            .position(|p| p.name == name)
+            .unwrap();
+        screen.select_row(row);
+    }
+
+    #[test]
+    fn list_is_a_tree_without_common_and_without_the_inherits_arrow() {
+        let mut screen = screen();
+        let lines = draw(&mut screen, 60, 10, |s, f, a, c| {
+            s.render_profiles_list(f, a, c).unwrap();
+        });
+        let text = lines.join("\n");
+        // Order: roots sorted, children nested below their parent, to any depth.
+        let rows: Vec<&str> = lines[1..=5].iter().map(String::as_str).collect();
+        assert!(rows[0].contains("linux"), "{text}");
+        assert!(rows[1].contains("└─ server"), "{text}");
+        assert!(rows[2].contains("macos"), "{text}");
+        assert!(rows[3].contains("└─ macbook-pro"), "{text}");
+        assert!(rows[4].contains("   └─ air"), "{text}");
+        // `common` is not a row, and there is no inherits arrow or cursor glyph.
+        assert!(!text.contains("common"), "{text}");
+        assert!(!text.contains('↑') && !text.contains('\u{f062}'), "{text}");
+        assert!(!text.contains('»'), "{text}");
+        // Own versus total file counts, from the resolved view.
+        assert!(rows[4].contains("5 files, 1 own"), "{text}");
+    }
+
+    #[test]
+    fn details_group_files_by_layer_in_inheritance_order() {
+        let mut screen = screen();
+        select(&mut screen, "air");
+        let lines = draw(&mut screen, 70, 30, |s, f, a, c| {
+            s.render_profile_details(f, a, c).unwrap();
+        });
+        let text = lines.join("\n");
+        let pos = |needle: &str| {
+            lines
+                .iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("missing {needle:?} in:\n{text}"))
+        };
+        assert!(text.contains("Inherits: macos › macbook-pro"), "{text}");
+        assert!(text.contains("5 files synced"), "{text}");
+        // common, then each ancestor root-first, then own.
+        assert!(pos("common") < pos("macos  1"), "{text}");
+        assert!(pos("macos  1") < pos("macbook-pro  1"), "{text}");
+        assert!(pos("macbook-pro  1") < pos("own  1"), "{text}");
+        assert!(pos(".zprofile") > pos("macos  1"), "{text}");
+        assert!(pos(".claude/pro.md") > pos("macbook-pro  1"), "{text}");
+    }
+
+    #[test]
+    fn details_scroll_reveals_every_file_past_the_old_ten_line_cap() {
+        let mut screen = screen();
+        let many: Vec<(String, &str)> = (0..60)
+            .map(|i| (format!(".file{i:02}"), "common"))
+            .collect();
+        let entries: Vec<(&str, &str)> = many.iter().map(|(p, s)| (p.as_str(), *s)).collect();
+        screen
+            .state
+            .resolved_files
+            .insert("air".to_string(), resolved(&entries));
+        select(&mut screen, "air");
+
+        let render = |screen: &mut ManageProfilesScreen| {
+            draw(screen, 70, 20, |s, f, a, c| {
+                s.render_profile_details(f, a, c).unwrap();
+            })
+            .join("\n")
+        };
+        let top = render(&mut screen);
+        assert!(top.contains(".file00") && !top.contains(".file59"), "{top}");
+        assert!(screen.state.details_max_scroll > 0);
+
+        // Page down until the end: the last file becomes visible and the offset stops at the max.
+        for _ in 0..20 {
+            screen.scroll_details(i32::from(screen.state.details_page));
+            render(&mut screen);
+        }
+        let bottom = render(&mut screen);
+        assert!(bottom.contains(".file59"), "{bottom}");
+        assert_eq!(screen.state.details_scroll, screen.state.details_max_scroll);
+
+        // Changing the selected profile starts the details pane at the top again.
+        select(&mut screen, "macos");
+        assert_eq!(screen.state.details_scroll, 0);
+    }
+
+    #[test]
+    fn long_paths_are_truncated_not_wrapped() {
+        assert_eq!(truncate_to("abcdef", 6), "abcdef");
+        assert_eq!(truncate_to("abcdefg", 6), "abcde…");
+        assert_eq!(truncate_to("é̀é", 2).chars().count(), 2);
     }
 }

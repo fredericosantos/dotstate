@@ -115,12 +115,16 @@ pub struct DotfileSelectionState {
     pub confirm_unsync_common: Option<usize>, // Index of common file to unsync
     // Remove custom file confirmation
     pub confirm_remove_custom: Option<usize>, // Index of custom file to remove
+    /// Ancestors of the active profile, root first. Each one that provides files gets its own
+    /// read-only section between the common files and the profile's own files.
+    pub inherited_layers: Vec<String>,
 }
 
 impl Default for DotfileSelectionState {
     fn default() -> Self {
         Self {
             dotfiles: Vec::new(),
+            inherited_layers: Vec::new(),
             preview_index: None,
             preview_scroll: 0,
             selected_for_sync: std::collections::HashSet::new(),
@@ -215,13 +219,35 @@ impl DotfileSelectionScreen {
             }
         }
 
-        // 2. Profile Files
+        // 2. Inherited layers, root ancestor first, one read-only section per ancestor.
+        for layer in &self.state.inherited_layers {
+            let layer_indices: Vec<usize> = self
+                .state
+                .dotfiles
+                .iter()
+                .enumerate()
+                .filter(|(_, d)| d.inherited_from.as_deref() == Some(layer.as_str()))
+                .map(|(i, _)| i)
+                .collect();
+            if layer_indices.is_empty() {
+                continue;
+            }
+            if !items.is_empty() {
+                items.push(DisplayItem::Header(String::new())); // Spacer
+            }
+            items.push(DisplayItem::Header(format!("{layer} Files (inherited)")));
+            for idx in layer_indices {
+                items.push(DisplayItem::File(idx));
+            }
+        }
+
+        // 3. Profile Files (the active profile's own)
         let profile_indices: Vec<usize> = self
             .state
             .dotfiles
             .iter()
             .enumerate()
-            .filter(|(_, d)| !d.is_common)
+            .filter(|(_, d)| !d.is_common && d.inherited_from.is_none())
             .map(|(i, _)| i)
             .collect();
 
@@ -454,6 +480,10 @@ impl DotfileSelectionScreen {
                                 let is_synced = self.state.selected_for_sync.contains(file_idx);
                                 let dotfile = &self.state.dotfiles[*file_idx];
 
+                                if let Some(toast) = inherited_notice(dotfile) {
+                                    return Ok(toast);
+                                }
+
                                 // If unsyncing a common file, show confirmation dialog
                                 if is_synced && dotfile.is_common {
                                     self.state.confirm_unsync_common = Some(*file_idx);
@@ -553,6 +583,9 @@ impl DotfileSelectionScreen {
                         if idx < display_items.len() {
                             if let DisplayItem::File(file_idx) = &display_items[idx] {
                                 let dotfile = &self.state.dotfiles[*file_idx];
+                                if let Some(toast) = inherited_notice(dotfile) {
+                                    return Ok(toast);
+                                }
                                 if dotfile.synced {
                                     return Ok(ScreenAction::ShowToast {
                                         message: "Unsync the file first before removing it".into(),
@@ -581,6 +614,9 @@ impl DotfileSelectionScreen {
                         if idx < display_items.len() {
                             if let DisplayItem::File(file_idx) = &display_items[idx] {
                                 let dotfile = &self.state.dotfiles[*file_idx];
+                                if let Some(toast) = inherited_notice(dotfile) {
+                                    return Ok(toast);
+                                }
                                 if dotfile.synced {
                                     // Validate before showing confirmation
                                     if !dotfile.is_common {
@@ -881,7 +917,13 @@ impl DotfileSelectionScreen {
 
         // Count common vs profile files for title
         let common_count = self.state.dotfiles.iter().filter(|d| d.is_common).count();
-        let profile_count = self.state.dotfiles.len() - common_count;
+        let inherited_count = self
+            .state
+            .dotfiles
+            .iter()
+            .filter(|d| d.inherited_from.is_some())
+            .count();
+        let profile_count = self.state.dotfiles.len() - common_count - inherited_count;
 
         #[allow(unused)] // list_idx is unused but is needed if we want to show tree structure
         let items: Vec<ListItem> = display_items
@@ -919,7 +961,9 @@ impl DotfileSelectionScreen {
 
                     let prefix = "";
 
-                    let style = if is_selected {
+                    let style = if dotfile.inherited_from.is_some() {
+                        Style::default().fg(t.text_muted)
+                    } else if is_selected {
                         Style::default().fg(t.success)
                     } else if dotfile.is_custom {
                         Style::default().fg(t.secondary)
@@ -957,7 +1001,11 @@ impl DotfileSelectionScreen {
             .position(selected_index);
 
         // Add focus indicator to files list with common/profile breakdown
-        let list_title = if common_count > 0 {
+        let list_title = if inherited_count > 0 {
+            format!(
+                " Dotfiles ({common_count} common, {inherited_count} inherited, {profile_count} profile) "
+            )
+        } else if common_count > 0 {
             format!(" Dotfiles ({common_count} common, {profile_count} profile) ")
         } else {
             format!(" Found {} dotfiles ", self.state.dotfiles.len())
@@ -1756,6 +1804,10 @@ impl DotfileSelectionScreen {
 
         // Update state
         self.state.dotfiles = dotfiles;
+        self.state.inherited_layers =
+            crate::utils::ProfileManifest::load_or_backfill(&config.repo_path)
+                .map(|m| crate::utils::ancestor_chain(&config.active_profile, &m.profiles))
+                .unwrap_or_default();
         self.state.selected_for_sync.clear();
 
         // Mark synced files as selected
@@ -2167,6 +2219,17 @@ impl DotfileSelectionScreen {
 }
 
 // Helper function to format file sizes
+/// Toast shown instead of an edit when the selected file is inherited from an ancestor profile.
+fn inherited_notice(dotfile: &crate::file_manager::Dotfile) -> Option<ScreenAction> {
+    dotfile
+        .inherited_from
+        .as_ref()
+        .map(|layer| ScreenAction::ShowToast {
+            message: format!("Inherited from '{layer}'. Change it in that profile."),
+            variant: crate::widgets::ToastVariant::Info,
+        })
+}
+
 fn format_size(bytes: u64) -> String {
     if bytes < 1024 {
         format!("{bytes}B")
@@ -2372,6 +2435,60 @@ mod tests {
         let screen = DotfileSelectionScreen::new();
         assert!(!screen.is_input_focused());
         assert!(screen.state.dotfiles.is_empty());
+    }
+
+    fn dotfile(
+        path: &str,
+        is_common: bool,
+        inherited_from: Option<&str>,
+    ) -> crate::file_manager::Dotfile {
+        crate::file_manager::Dotfile {
+            original_path: PathBuf::from("/home").join(path),
+            relative_path: PathBuf::from(path),
+            synced: true,
+            description: None,
+            is_common,
+            is_custom: false,
+            inherited_from: inherited_from.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn display_items_list_common_then_each_ancestor_then_own() {
+        let mut screen = DotfileSelectionScreen::new();
+        screen.state.dotfiles = vec![
+            dotfile(".a-common", true, None),
+            dotfile(".b-macos", false, Some("macos")),
+            dotfile(".c-pro", false, Some("macbook-pro")),
+            dotfile(".d-own", false, None),
+        ];
+        // Root first, and deeper than one level: the sections follow the chain, not a fixed shape.
+        screen.state.inherited_layers = vec!["macos".to_string(), "macbook-pro".to_string()];
+
+        let headers: Vec<String> = screen
+            .get_display_items("air")
+            .into_iter()
+            .filter_map(|item| match item {
+                DisplayItem::Header(h) if !h.is_empty() => Some(h),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            headers,
+            vec![
+                "Common Files (Shared)",
+                "macos Files (inherited)",
+                "macbook-pro Files (inherited)",
+                "Profile Files (air)",
+            ]
+        );
+    }
+
+    #[test]
+    fn inherited_files_are_read_only() {
+        assert!(inherited_notice(&dotfile(".x", false, Some("macos"))).is_some());
+        assert!(inherited_notice(&dotfile(".x", false, None)).is_none());
+        assert!(inherited_notice(&dotfile(".x", true, None)).is_none());
     }
 
     #[test]
