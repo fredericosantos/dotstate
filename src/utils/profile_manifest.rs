@@ -637,12 +637,18 @@ impl ProfileManifest {
     /// chain and merging.
     ///
     /// Child packages override parent packages with the same `name + manager` key.
+    /// `[common]` packages are included as the lowest layer.
     pub fn resolve_packages(&self, profile_name: &str) -> Result<Vec<Package>> {
         let chain = self.inheritance_chain(profile_name)?;
 
         // Walk from root ancestor to child so child overrides parent
         // Key: (package_name, manager) -> Package
         let mut pkg_map: HashMap<(String, PackageManager), Package> = HashMap::new();
+
+        // Common packages are the lowest layer, like common files: any profile in the chain overrides them.
+        for pkg in &self.common.packages {
+            pkg_map.insert((pkg.name.clone(), pkg.manager.clone()), pkg.clone());
+        }
 
         for profile_name in chain.iter().rev() {
             if let Some(profile) = self.profiles.iter().find(|p| &p.name == profile_name) {

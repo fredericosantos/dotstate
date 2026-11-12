@@ -1094,6 +1094,27 @@ mod tests {
     }
 
     #[test]
+    fn test_get_resolved_packages_includes_common() {
+        let dir = repo_with_chain();
+        let repo = dir.path();
+        PackageService::add_common_package(repo, make_test_package("rclone")).unwrap();
+        PackageService::add_package(repo, "work", make_test_package("curl")).unwrap();
+
+        let names = |profile: &str| -> Vec<String> {
+            PackageService::get_resolved_packages(repo, profile)
+                .unwrap()
+                .into_iter()
+                .map(|p| p.name)
+                .collect()
+        };
+        assert_eq!(
+            names("laptop"),
+            vec!["curl".to_string(), "rclone".to_string()]
+        );
+        assert_eq!(names("other"), vec!["rclone".to_string()]);
+    }
+
+    #[test]
     fn test_add_allowed_across_unrelated_profiles_and_new_names() {
         let dir = repo_with_chain();
         let repo = dir.path();
