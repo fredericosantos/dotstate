@@ -179,10 +179,10 @@ fn add_common_then_list_common_shows_it() -> Result<()> {
     assert_eq!(manifest.common.packages.len(), 1);
     assert!(manifest.profiles[0].packages.is_empty());
 
-    // And the profile list does not show it.
+    // The profile's resolved list includes it, but the profile itself does not store it.
     let r = cli.run(&["packages", "list", "--profile", "default"]);
     assert!(r.status_ok, "{}", r.all());
-    assert!(!r.stdout.contains("mytool"), "{}", r.all());
+    assert!(r.stdout.contains("mytool"), "{}", r.all());
     Ok(())
 }
 
