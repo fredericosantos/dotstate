@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Profiles**: The details pane groups files by the layer that provides them: `common`, then each ancestor from the root down, then `own`, with a count per layer. It scrolls with the page keys and the mouse wheel instead of stopping at ten files.
 - **Manage files**: Files inherited from ancestor profiles are listed in a read-only section per ancestor, between the common files and the profile's own files. Changing one shows which profile provides it.
 
+### Fixed
+
+- **Symlinks**: A common file overridden by a profile layer is no longer linked back to `common` after `sync` pulls, and each target now has one tracking entry with the most specific source. Before, `doctor` reported "symlinks point to wrong targets" for these files and `doctor --fix` could not clear it.
+
 ---
 
 ## [0.4.5] - 2026-10-18

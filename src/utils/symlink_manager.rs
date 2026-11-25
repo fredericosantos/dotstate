@@ -275,15 +275,7 @@ impl SymlinkManager {
                 op.status,
                 OperationStatus::Success | OperationStatus::Skipped(_)
             ) {
-                let already_tracked = self.tracking.symlinks.iter().any(|s| s.target == op.target);
-                if !already_tracked {
-                    self.tracking.symlinks.push(TrackedSymlink {
-                        target: op.target.clone(),
-                        source: op.source.clone(),
-                        created_at: op.timestamp,
-                        backup: op.backup.clone(),
-                    });
-                }
+                self.track(op);
             }
         }
 
@@ -1048,7 +1040,31 @@ impl SymlinkManager {
         }
     }
 
-    /// Get all tracked symlinks
+    /// Record `op` as the single tracking entry for its target.
+    ///
+    /// A target has one link on disk, so it has one entry: any older entry
+    /// (e.g. a stale `common` source shadowed by a profile layer) is replaced.
+    /// The oldest backup is kept, since it holds the user's original file.
+    fn track(&mut self, op: &SymlinkOperation) {
+        let mut oldest_backup = None;
+        self.tracking.symlinks.retain(|s| {
+            if s.target != op.target {
+                return true;
+            }
+            if oldest_backup.is_none() {
+                oldest_backup = s.backup.clone();
+            }
+            false
+        });
+        let backup = oldest_backup.or_else(|| op.backup.clone());
+        self.tracking.symlinks.push(TrackedSymlink {
+            target: op.target.clone(),
+            source: op.source.clone(),
+            created_at: op.timestamp,
+            backup,
+        });
+    }
+
     /// Get all tracked symlinks
     #[allow(dead_code)] // Kept for potential future use in CLI or programmatic access
     #[must_use]
@@ -1199,12 +1215,7 @@ impl SymlinkManager {
 
         // Update tracking if successful
         if matches!(operation.status, OperationStatus::Success) {
-            self.tracking.symlinks.push(TrackedSymlink {
-                target: operation.target.clone(),
-                source: operation.source.clone(),
-                created_at: operation.timestamp,
-                backup: operation.backup.clone(),
-            });
+            self.track(&operation);
 
             // Update active profile if not set
             if self.tracking.active_profile.is_empty() {
@@ -1327,12 +1338,7 @@ impl SymlinkManager {
             match self.create_symlink(&source, &target, &resolved.relative_path) {
                 Ok(operation) => {
                     if matches!(operation.status, OperationStatus::Success) {
-                        self.tracking.symlinks.push(TrackedSymlink {
-                            target: operation.target.clone(),
-                            source: operation.source.clone(),
-                            created_at: operation.timestamp,
-                            backup: operation.backup.clone(),
-                        });
+                        self.track(&operation);
 
                         if self.tracking.active_profile.is_empty() {
                             self.tracking.active_profile = profile_name.to_string();
@@ -1464,12 +1470,7 @@ impl SymlinkManager {
 
         // Update tracking if successful
         if matches!(operation.status, OperationStatus::Success) {
-            self.tracking.symlinks.push(TrackedSymlink {
-                target: operation.target.clone(),
-                source: operation.source.clone(),
-                created_at: operation.timestamp,
-                backup: operation.backup.clone(),
-            });
+            self.track(&operation);
 
             self.save_tracking()?;
             info!("Successfully added common symlink for {}", relative_path);
@@ -1640,12 +1641,7 @@ impl SymlinkManager {
                 Ok(op) => {
                     if matches!(op.status, OperationStatus::Success) {
                         created_count += 1;
-                        self.tracking.symlinks.push(TrackedSymlink {
-                            target: op.target,
-                            source: op.source,
-                            created_at: op.timestamp,
-                            backup: op.backup,
-                        });
+                        self.track(&op);
                     }
                 }
                 Err(e) => {
@@ -1710,20 +1706,7 @@ impl SymlinkManager {
                 operation.status,
                 OperationStatus::Success | OperationStatus::Skipped(_)
             ) {
-                // Check if already tracked (avoid duplicates)
-                let already_tracked = self
-                    .tracking
-                    .symlinks
-                    .iter()
-                    .any(|s| s.target == operation.target);
-                if !already_tracked {
-                    self.tracking.symlinks.push(TrackedSymlink {
-                        target: operation.target.clone(),
-                        source: operation.source.clone(),
-                        created_at: operation.timestamp,
-                        backup: operation.backup.clone(),
-                    });
-                }
+                self.track(&operation);
             }
 
             operations.push(operation);

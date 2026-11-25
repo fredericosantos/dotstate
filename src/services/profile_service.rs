@@ -613,12 +613,20 @@ impl ProfileService {
             return Ok((0, 0, Vec::new()));
         }
 
-        // Convert to Vec<String> for the symlink manager
-        let common_files_vec = common_files.to_vec();
-
-        // Use SymlinkManager to ensure symlinks
         let mut symlink_mgr =
             SymlinkManager::new_with_backup(repo_path.to_path_buf(), backup_enabled)?;
+
+        // Skip common files a profile in the active chain overrides: linking
+        // them would point the target back at `common`.
+        let common_files_vec: Vec<String> = match symlink_mgr.get_active_profile() {
+            Some(active) => manifest
+                .resolve_files(active)?
+                .into_iter()
+                .filter(|f| f.source_profile == "common")
+                .map(|f| f.relative_path)
+                .collect(),
+            None => common_files.to_vec(),
+        };
 
         symlink_mgr.ensure_common_symlinks(&common_files_vec)
     }
